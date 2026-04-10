@@ -1,0 +1,1495 @@
+---
+title: "Fisher DNA + Cameras — State-Space Prep, Occasions & Detection Histories"
+author: "Prepared for new analysts"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+  word_document: default
+---
+
+> **Purpose**: Read cleaned **DNA** (hair snagger) and **camera** data, apply project-specific rules, 
+> assign **state spaces**, construct **occasion-based** structures for DNA (\`Y.s\`) and cameras (\`O.o\`, \`O.o2\`), and 
+> save a workspace for downstream SCR / integrated models.
+>
+> **How to use?**  Update the **Parameters** (paths/season) and knit.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 8, fig.height = 6)
+options(stringsAsFactors = FALSE, scipen = 999)
+```
+
+## Packages
+Installs any missing packages (CRAN) and loads them.
+
+```{r packages}
+pkgs <- c(
+  "sf","rmapshaper","dplyr","readr","lubridate","stringr","tidyr",
+  "purrr","ggplot2","camtrapR","data.table","plyr","scales", "cowplot"
+)
+missing <- setdiff(pkgs, rownames(installed.packages()))
+if (length(missing)) install.packages(missing, repos = "https://cloud.r-project.org")
+invisible(lapply(pkgs, library, character.only = TRUE))
+```
+
+## Parameters — **Edit these**
+
+```{r parameters}
+species_of_interest <- "Pekania pennanti"
+season              <- "all"     # "winter" or "all"
+crs_wgs84           <- 4326
+crs_albers          <- 3005          # BC Albers (meters)
+buffer_m            <- 17000         # Columbian AOI buffer
+coord_scale_km      <- 1000          # meters -> km
+occasion_length     <- 14            # days for detectionHistory
+tz_local            <- "America/Vancouver"
+preserve_zero_projects <- TRUE
+
+root       <- "I:/Ecosystems/Conservation Science/Species/Mesocarnivores/Projects/MMP/2.Data"
+local_root <- "C:/LocalR"
+
+paths <- list(
+  shp_meso_grid      = file.path(local_root, "BC_meso_grid.shp"),
+  shp_columbian_grid = file.path(local_root, "BC_meso_grid_columbian.shp"),
+  gdb_subpops        = file.path(root, "9. GIS/BC_Fisher_populations_2024_edited.gdb"),
+  gdb_layer_subpops  = "Subpopulations",
+  dna_clean          = file.path(root, "1. MDB-Collation/5. Master data cleaned/Species specific/Fisher/DNA_fisher_clean_states.csv"),
+  cams_all           = file.path(root, "1. MDB-Collation/5. Master data cleaned/Species specific/Fisher/camera_deployments_singledeployment_2026-02-24.csv"),
+  cams_winter        = file.path(root, "1. MDB-Collation/5. Master data cleaned/Species specific/Fisher/camera_deployments_singledeployment_winter2026-03-02.csv"),
+  det_all            = file.path(root, "1. MDB-Collation/5. Master data cleaned/Species specific/Fisher/fisher_detections_singledeployment_2026-02-24.csv"),
+  det_winter         = file.path(root, "1. MDB-Collation/5. Master data cleaned/Species specific/Fisher/fisher_detections_singledeployment_winter2026-03-02.csv"),
+  out_dir            = local_root,
+  save_rdata_winter  = file.path(local_root, "SCR_Dcov_IntegratedRamsey/Process_Fisher_camera-DNA_winter-only_Feb.RData"),
+  save_rdata_all     = file.path(local_root, "SCR_Dcov_IntegratedRamsey/Process_Fisher_camera-DNA_allseasons_March.RData")
+)
+```
+
+## Helper functions
+Reusable utilities for sf conversion, project rules, state assignment, scaling, and bounds.
+
+```{r helpers}
+make_sf_points <- function(df, lon, lat, crs_in = 4326, crs_out = 3005) {
+  df_sf <- sf::st_as_sf(df, coords = c(lon, lat), crs = crs_in, remove = FALSE) |>
+    sf::st_transform(crs_out)
+  coords <- sf::st_coordinates(df_sf)
+  dplyr::mutate(df_sf, UTM_X = coords[,1], UTM_Y = coords[,2])
+}
+
+apply_project_rules <- function(df, rules_tbl) {
+  out <- df
+  for (i in seq_len(nrow(rules_tbl))) {
+    pat <- rules_tbl$project_match[i]
+    fun <- rules_tbl$rename_fun[[i]]
+    idx <- which(out$Project_name == pat)
+    if (length(idx)) out[idx, ] <- fun(out[idx, ])
+  }
+  out
+}
+
+assign_states <- function(df, state_map_tbl) {
+  dplyr::left_join(df, state_map_tbl, by = "Project_name")
+}
+
+```
+
+## Read spatial AOI and subpopulations
+- Read and buffer the **Columbian** grid (17 km).
+- Read **subpopulations** for context plotting.
+
+```{r aoi}
+grid_columbian <- sf::st_read(paths$shp_columbian_grid, quiet = TRUE) |>
+  sf::st_transform(crs_albers)
+
+columbian_area <- grid_columbian |>
+  sf::st_union() |>
+  rmapshaper::ms_simplify(keep = 0.01, keep_shapes = FALSE) |>
+  sf::st_buffer(buffer_m)
+
+subpopulations <- sf::st_read(paths$gdb_subpops, layer = paths$gdb_layer_subpops, quiet = TRUE) |>
+  sf::st_transform(crs_albers) |>
+  rmapshaper::ms_simplify(keep = 0.1, keep_shapes = FALSE)
+```
+
+## Read **DNA** cleaned data (already processed in prior script)
+- Uses the **cleaned** CSV with state (if present) and coordinates.
+
+```{r dna}
+DNA <- readr::read_csv(paths$dna_clean, show_col_types = FALSE)
+stopifnot(all(c("Longitude_DD","Latitude_DD") %in% names(DNA)))
+DNA <- make_sf_points(DNA, lon = "Longitude_DD", lat = "Latitude_DD",
+                      crs_in = crs_wgs84, crs_out = crs_albers)
+```
+
+## Read **camera deployments** & **detections**
+Select inputs by `season`. Convert to sf and attach Albers coordinates.
+
+```{r cams-read}
+cams_file <- if (season == "winter") paths$cams_winter else paths$cams_all
+det_file  <- if (season == "winter") paths$det_winter else paths$det_all
+
+cameras_grid <- readr::read_csv(cams_file, show_col_types = FALSE) |>
+  dplyr::select(Project_name, Station_ID, Latitude, Longitude,
+                Start_Deployment_date, End_Deployment_date) |>
+  tidyr::drop_na(Latitude, Longitude) |>
+  make_sf_points(lon = "Longitude", lat = "Latitude",
+                 crs_in = crs_wgs84, crs_out = crs_albers)
+
+sp_cam <- readr::read_csv(det_file, show_col_types = FALSE) |>
+  dplyr::select(Project_name, Species, Station_ID, Latitude, Longitude, Date_Time.y) |>
+  tidyr::drop_na(Date_Time.y)
+```
+
+## Basemap & quick QA plots
+
+```{r qa-plot}
+# All points overlay for orientation
+p_all <- ggplot() +
+  geom_sf(data = columbian_area, fill = NA, color = "grey50") +
+  geom_sf(data = dplyr::filter(subpopulations, Subpop != "Boreal"), aes(fill = Subpop), alpha = 0.3) +
+  geom_sf(data = DNA, color = "firebrick", size = 1, alpha = 0.7) +
+  geom_sf(data = cameras_grid, color = "purple", size = 1, alpha = 0.7) +
+  ggtitle("DNA & Camera deployments over Columbian AOI") + theme_minimal()
+
+p_all
+```
+# DNA sampling by project
+
+```{r}
+DNA_by_project <- ggplot()+
+  geom_sf(data = columbian_area, fill = NA, color = "grey50") +
+  geom_sf(data = dplyr::filter(subpopulations, Subpop != "Boreal"), aes(fill = Subpop), alpha = 0.3) +
+  geom_sf(data = DNA,aes(color = Project_name), size = 1) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom",       # move legend out of the way
+    legend.key.width = unit(6, "pt"), # shrink keys
+    legend.key.height = unit(6, "pt"),
+    legend.text = element_text(size = 6),
+    legend.title = element_text(size = 7)
+  ) +
+  guides(
+    color = guide_legend(
+      nrow = 3,                       # put legend items on one row
+      byrow = TRUE,
+      override.aes = list(size = 3)   # make legend points/lines smaller
+    )
+  )
+
+
+DNA_by_project
+```
+
+# Camera sampling by project
+
+```{r}
+camera_by_project <- ggplot()+
+  geom_sf(data = columbian_area, fill = NA, color = "grey50") +
+  geom_sf(data = dplyr::filter(subpopulations, Subpop != "Boreal"), aes(fill = Subpop), alpha = 0.3) +
+  geom_sf(data= cameras_grid,  aes(color = Project_name))+
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom",       # move legend out of the way
+    legend.key.width = unit(6, "pt"), # shrink keys
+    legend.key.height = unit(6, "pt"),
+    legend.text = element_text(size = 6),
+    legend.title = element_text(size = 7)
+  ) +
+  guides(
+    color = guide_legend(
+      nrow = 3,                       # put legend items on one row
+      byrow = TRUE,
+      override.aes = list(size = 3)   # make legend points/lines smaller
+    )
+  )
+
+
+camera_by_project
+```
+# Plot by project of interest
+
+```{r}
+project_to_explore <- "Chilcotin Cougar Project"
+
+p_explore <- ggplot()+
+  geom_sf(data = cameras_grid, color= "black", size = 1) +
+  geom_sf(data= filter(cameras_grid, Project_name==project_to_explore), aes(color = Station_ID)) 
+p_explore
+
+```
+
+
+## Project rules and state map
+Based on earlier graphs, decide on state space assigment and change below accordingly
+Two common renames are implemented programmatically. Update as needed.
+
+```{r rules-states}
+
+project_rules <- tibble::tibble(
+  project_match = c(
+    "Interior BC Moose Predator Camera Study",
+    "Fisher Exclusion Box Program"
+  ),
+  rename_fun = list(
+    function(df) dplyr::mutate(
+      df,
+      Project_name = ifelse(
+        grepl("^PGS", Station_ID),
+        "Interior BC Moose & Predator Camera Study-1",
+        "Interior BC Moose & Predator Camera Study-2"
+      )
+    ),
+    function(df) dplyr::mutate(
+      df,
+      Project_name = dplyr::case_when(
+        stringr::str_detect(Station_ID, "^(WS|JD)") ~ "Fisher Exclusion Box Program-1",
+        TRUE ~ "Fisher Exclusion Box Program-2"
+      )
+    )
+  )
+)
+
+
+state_map <- tibble::tribble(
+  ~Project_name,                                      ~State,
+  "Grizzly Bear Corridor 2021",                       2,
+  "Skeena Predator Project UBCO",                     3,
+  "Fisher Exclusion Box Program-1",                   4,
+  "Interior BC Moose & Predator Camera Study-1",      4,
+  "Itcha Ilgachuz",                                   5,
+  "South Chilcotin Mountains Camera Sampling",        5,
+  "Chilcotin Cougar Project",                         5,
+  "Chilcotin Cougar Project Prey Grid",               5,
+  "Chilcotin Grizzy Bear Cameras 2021",               5,
+  "Chilcotin Restoration Monitoring 2023",            5,
+  "data_TNG trail cameras_2023.xlsx",                 5,
+  "Esketemc Adaptive Management Project",             6,
+  "BC SIM Deer",                                      6,
+  "Interior BC Moose & Predator Camera Study-2",      6,
+  "Fisher Exclusion Box Program-2",                   6
+)
+```
+
+
+## Apply project rules & assign states
+- For cameras and detections.
+- Create a **short** camera set within AOI and de-duplicated to one row per station.
+
+```{r apply-rules}
+# Apply rules
+cameras_grid <- apply_project_rules(cameras_grid, project_rules)
+sp_cam       <- apply_project_rules(sp_cam, project_rules)
+
+# AOI-filter & one row per Station_ID (deployment with earliest start)
+cameras_grid_aoi <- sf::st_intersection(cameras_grid, columbian_area)
+
+cameras_grid_short <- cameras_grid_aoi |>
+  sf::st_drop_geometry() |>
+  dplyr::arrange(Station_ID, Start_Deployment_date) |>
+  dplyr::distinct(Station_ID, .keep_all = TRUE) |>
+  make_sf_points(lon = "Longitude", lat = "Latitude", crs_in = crs_wgs84, crs_out = crs_albers)
+
+# Optional programmatic outlier removal by ID/project (kept as per original intent)
+cameras_to_remove <- c("witw14", "witw12", "Scat Study 05", "RC-06", "3087.1", "4210.5", "4210_R", "BCTA55")
+cameras_grid_short1 <- cameras_grid_short |>
+  dplyr::filter(Project_name != "Serb Creek West Babine Wildlife Cameras" | is.na(Project_name)) |>
+  dplyr::filter(!Station_ID %in% cameras_to_remove)
+
+# Assign states
+cameras_grid_states <- assign_states(cameras_grid_short1, state_map)
+DNA_states          <- assign_states(DNA, state_map)
+sp_cam_states       <- assign_states(sp_cam, state_map)
+
+# QA: any NA States?  ## should be 0, if not use code commented out below.
+sum(is.na(cameras_grid_states$State))
+sum(is.na(DNA_states$State))
+
+cameras_na <- cameras_grid_states %>%
+    dplyr::filter(is.na(State)) %>%
+    dplyr::select(Project_name, Station_ID, Start_Deployment_date, End_Deployment_date) %>%
+    arrange(Project_name, Station_ID)
+unique(cameras_na$Project_name)
+#Cap to first year per station (≤ 365 days)
+deploy_df_cap <- cameras_grid_states %>%
+  dplyr::mutate(
+    Start_Deployment_date = as.Date(Start_Deployment_date),
+    End_Deployment_date   = as.Date(End_Deployment_date),
+    End_Deployment_date   = pmin(End_Deployment_date, Start_Deployment_date + 365 - 1)
+  ) %>%
+  dplyr::filter(End_Deployment_date >= Start_Deployment_date)
+
+# ... then in the cam-ops-preserve chunk:
+deploy_df <- deploy_df_cap   # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< use the capped table
+
+```
+
+## Visual verification of state spaces
+
+```{r verify-states}
+pp <- ggplot() +
+    geom_sf(data = columbian_area, fill = NA, color = "grey50") +
+  geom_sf(data = dplyr::filter(subpopulations, Subpop != "Boreal"), aes(fill = Subpop), alpha = 0.5) +  
+ # scale_fill_grey(start = 0.9, end = 0.4)+
+    geom_sf(data = DNA_states, aes(color = as.factor(State.x)), size = 1) +
+  geom_sf(data = cameras_grid_states, aes(color = as.factor(State)), size = 1, shape = 1) +
+  ggtitle("DNA (points) and Cameras (rings) by State") +
+  theme_minimal()
+pp
+```
+
+## DNA occasions & `Y.s` array
+
+#Split by state
+```{r}
+#create list of both databases based on state space
+DNA_states$State <- DNA_states$State.x
+
+cam_short_list <- split(cameras_grid_states, f= cameras_grid_states$State)
+
+DNA_short_list <- split(DNA_states, f= DNA_states$State)
+```
+
+## Build DNA operability matrices O.s (stations x occasions, 0/1)
+```{r}
+## ---- Build DNA operability matrices O.s (stations x occasions, 0/1) ----
+## Robust to chunk order:
+##  - Computes 'occasion' locally (rleid(End_date))
+##  - Recreates station ordering exactly as in Y.s (after species filter on Animal_ID)
+##  - Returns a list O.s with one matrix per state; rows = stations, cols = occasions, values in {0,1}
+
+# Helper: add occasions with the same rule used for Y.s
+add_occasions <- function(dna_state_df) {
+  if (!("End_date" %in% names(dna_state_df))) {
+    stop("DNA table is missing 'End_date' needed to compute occasions.")
+  }
+  dna_state_df |>
+    dplyr::group_by(State, Project_name, Station_ID) |>
+    dplyr::arrange(State,
+                   stringr::str_to_lower(Project_name),
+                   Station_ID, End_date) |>
+    dplyr::mutate(occasion = data.table::rleid(End_date)) |>
+    dplyr::ungroup()
+}
+
+# Helper: station order identical to Y.s build
+# (set Animal_ID = NA for non-fisher, then pivot wide and read the station columns)
+get_station_order <- function(dna_state_df, species_of_interest) {
+  nm <- dna_state_df |>
+    dplyr::mutate(Animal_ID = dplyr::case_when(
+      Species == species_of_interest ~ Animal_ID,
+      TRUE ~ NA_character_
+    )) |>
+    sf::st_drop_geometry() |>
+    dplyr::mutate(st_filler = "goop") |>
+    dplyr::select(Station_ID, Animal_ID, st_filler) |>
+    dplyr::distinct() |>
+    tidyr::pivot_wider(
+      names_from  = Station_ID,
+      values_from = st_filler,
+      names_prefix = "st_"
+    ) |>
+    dplyr::filter(!duplicated(Animal_ID)) |>
+    dplyr::filter(!is.na(Animal_ID)) |>
+    dplyr::arrange(Animal_ID) |>
+    names()
+
+  # If pivot produced only 'Animal_ID' (no station columns), return empty
+  if (length(nm) <= 1L) return(character(0))
+  nm <- nm[-1L]                     # drop 'Animal_ID'
+  sub("^st_", "", nm)               # strip 'st_' to get raw Station_IDs
+}
+
+# Build one O.s matrix for a state's DNA table
+build_Os_for_state <- function(dna_state_df, species_of_interest) {
+  if (is.null(dna_state_df) || nrow(dna_state_df) == 0) {
+    return(matrix(numeric(0), 0, 0))
+  }
+
+  # Compute local occasions (same rule as Y.s)
+  dna_occ <- add_occasions(dna_state_df)
+
+  # Number of occasions (K)
+  K <- suppressWarnings(max(dna_occ$occasion, na.rm = TRUE))
+  if (!is.finite(K) || K < 1L) {
+    return(matrix(numeric(0), 0, 0))
+  }
+
+  # Station order aligned to Y.s (after species filter on Animal_ID)
+  st_ids <- get_station_order(dna_occ, species_of_interest)
+  if (length(st_ids) == 0L) {
+    # No station columns present once aligned to Y.s
+    return(matrix(numeric(0), 0, 0))
+  }
+
+  # Initialize matrix
+  Os <- matrix(
+    0L,
+    nrow = length(st_ids),
+    ncol = K,
+    dimnames = list(st_ids, paste0("Occ_", seq_len(K)))
+  )
+
+  # A station is "operable = 1" in an occasion if it appears in the DNA table in that occasion
+  # NOTE: Operability is not filtered by species — it reflects trap availability.
+  for (k in seq_len(K)) {
+    active <- dna_occ |>
+      sf::st_drop_geometry() |>
+      dplyr::filter(occasion == k) |>
+      dplyr::distinct(Station_ID) |>
+      dplyr::pull(Station_ID)
+    if (length(active)) Os[st_ids %in% active, k] <- 1L
+  }
+
+  Os
+}
+
+# ---- Build O.s as a list (one matrix per state) ----
+O.s <- vector("list", length(DNA_short_list))
+names(O.s) <- names(DNA_short_list)
+
+for (i in seq_along(DNA_short_list)) {
+  O.s[[i]] <- build_Os_for_state(DNA_short_list[[i]], species_of_interest)
+}
+
+# ---- Optional: sanity checks vs Ys_list (if available) ----
+# If you've run the Y.s chunk, check that O.s rows (= stations) and cols (= occasions) match
+try({
+  if (exists("Ys_list")) {
+    for (i in seq_along(O.s)) {
+      # Only check states that actually produced a Y.s (Ys_list entry not NULL)
+      if (!is.null(Ys_list[[i]]) && length(Ys_list[[i]]) > 0) {
+        # Some states may have 0 individuals but still a station set;
+        # J and K from Ys_list are the intended station/occasion counts.
+        if (nrow(O.s[[i]]) != Ys_list[[i]]$J || ncol(O.s[[i]]) != Ys_list[[i]]$K) {
+          message(sprintf(
+            "Note: state '%s' has O.s dim %s x %s, while Y.s expects %s x %s",
+            names(O.s)[i], nrow(O.s[[i]]), ncol(O.s[[i]]),
+            Ys_list[[i]]$J, Ys_list[[i]]$K
+          ))
+        }
+      }
+    }
+  }
+}, silent = TRUE)
+
+# Optional quick summary to console (uncomment to inspect)
+# print(lapply(O.s, dim))
+```
+
+
+```{r dna-occasions}
+library(data.table)
+
+# Build occasions (run-length ID by End_date) and construct Y.s per state
+make_Ys_for_state <- function(dna_state_df) {
+  dna_state_df <- dna_state_df |>
+    dplyr::mutate(Animal_ID = dplyr::case_when(
+      Species == species_of_interest ~ Animal_ID, TRUE ~ NA_character_
+    )) |>
+    dplyr::group_by(State, Project_name, Station_ID) |>
+    dplyr::arrange(State, stringr::str_to_lower(Project_name), Station_ID, End_date) |>
+    dplyr::mutate(occasion = data.table::rleid(End_date)) |>
+    dplyr::ungroup()
+
+  matrix_frame <- dna_state_df |>
+    sf::st_drop_geometry() |>
+    dplyr::mutate(st_filler = 'goop') |>
+    dplyr::select(Station_ID, Animal_ID, st_filler) |>
+    dplyr::distinct() |>
+    tidyr::pivot_wider(names_from = Station_ID, values_from = st_filler, names_prefix = 'st_') |>
+    dplyr::filter(!duplicated(Animal_ID)) |>
+    dplyr::filter(!is.na(Animal_ID)) |>
+    dplyr::arrange(Animal_ID)
+
+  n_ind <- dplyr::n_distinct(stats::na.omit(matrix_frame$Animal_ID))
+  K     <- max(dna_state_df$occasion)
+  J     <- ncol(matrix_frame) - 1L
+
+  make_occ_tbl <- function(k_) {
+    dat <- dna_state_df |>
+      dplyr::filter(occasion == k_) |>
+      sf::st_drop_geometry() |>
+      dplyr::filter(!is.na(Animal_ID)) |>
+      dplyr::select(Animal_ID, Station_ID, Species) |>
+      tidyr::pivot_wider(names_from = Station_ID, values_from = Species, names_prefix = 'st_') |>
+      dplyr::mutate(dplyr::across(-Animal_ID, ~ dplyr::case_when(is.na(.x) ~ 0L, .x == species_of_interest ~ 1L, TRUE ~ 0L)))
+
+    st_cols <- names(dat)[-1]
+    filler  <- matrix_frame |>
+      dplyr::select(-all_of(st_cols)) |>
+      dplyr::mutate(dplyr::across(-Animal_ID, ~ 0L))
+
+    out <- dplyr::left_join(dat, filler, by = "Animal_ID") |>
+      dplyr::bind_rows(filler[!filler$Animal_ID %in% dat$Animal_ID, ]) |>
+      dplyr::mutate(dplyr::across(-Animal_ID, ~ ifelse(is.na(.x), 0L, .x))) |>
+      dplyr::arrange(Animal_ID) |>
+      dplyr::select(Animal_ID, names(matrix_frame)[-1])
+    out
+  }
+
+  occ_tbls <- purrr::map(1:K, make_occ_tbl)
+  Y_s <- array(0L, dim = c(n_ind, J, K))
+  for (k in seq_len(K)) Y_s[,,k] <- as.matrix(occ_tbls[[k]][,-1L])
+  list(Y_s = Y_s, n_ind = n_ind, J = J, K = K)
+}
+
+Ys_list <- purrr::map(DNA_short_list, make_Ys_for_state)
+Y.s <- purrr::map(Ys_list, "Y_s")
+```
+
+## Camera operation & detection histories — **preserve zero-detection projects**
+This section ensures that **every project with deployments** contributes to `detectionHistory()` even if it has **no detections**. We achieve this by adding a **single placeholder record** to those projects before running `detectionHistory()`, and then **zero out** the resulting detections so that counts remain correct but matrix shapes include all projects.
+
+```{r cam-ops-preserve}
+
+# ---- Camera operation & detection histories (preserve zero-detection projects) ----
+# This chunk yields an outer list DetHist of length = number of states with deployments (often 4)
+# and inner list lengths equal to the number of projects per state, e.g. c(1, 2, 6, 4).
+
+# Use the same deployment/detection objects as your pipeline
+deploy_df <- if (exists("cameras_grid_short_states")) cameras_grid_short_states else cameras_grid_states
+det_df    <- sp_cam_states
+
+# Safety default: preserve projects that have deployments but zero detections
+if (!exists("preserve_zero_projects", inherits = FALSE)) preserve_zero_projects <- TRUE
+
+# camtrapR wants the datetime column as character
+det_df$Species    <- species_of_interest
+det_tbl           <- as.data.frame(det_df)
+det_tbl$Date_Time2 <- as.character(det_tbl$Date_Time.y)
+
+# Split by STATE (only states that actually have deployments remain, e.g., 4 states)
+camgrid_by_state <- split(deploy_df, f = deploy_df$State)
+cam_by_state     <- split(det_tbl,  f = det_tbl$State)
+
+CampOp.list <- vector("list", length(camgrid_by_state))
+DetHist     <- vector("list", length(camgrid_by_state))
+names(CampOp.list) <- names(camgrid_by_state)
+names(DetHist)     <- names(camgrid_by_state)
+
+for (s in seq_along(camgrid_by_state)) {
+
+  # -------------------- Deployments by project (within state s) --------------------
+  cam_df <- camgrid_by_state[[s]] %>%
+    dplyr::filter(!is.na(Project_name)) %>%
+    dplyr::arrange(stringr::str_to_lower(Project_name), Station_ID)
+
+  # Split using the SAME arranged data frame (prevents misalignment)
+  cam_deploy_by_proj <- split(cam_df, f = cam_df$Project_name, drop = TRUE)
+  all_projects       <- names(cam_deploy_by_proj)
+
+  # cameraOperation per project
+  CampOp.list[[s]] <- lapply(
+    cam_deploy_by_proj,
+    function(df_proj) {
+      camtrapR::cameraOperation(
+        CTtable        = sf::st_drop_geometry(df_proj),
+        stationCol     = "Station_ID",
+        setupCol       = "Start_Deployment_date",
+        retrievalCol   = "End_Deployment_date",
+        hasProblems    = FALSE,
+        dateFormat     = "ymd",
+        occasionStartTime = 0
+      )
+    }
+  )
+
+  # -------------------- Detections by project (within state s) --------------------
+  if (length(cam_by_state) >= s && !is.null(cam_by_state[[s]]) && nrow(cam_by_state[[s]]) > 0) {
+    det_state <- cam_by_state[[s]] %>%
+      dplyr::filter(!is.na(Project_name)) %>%
+      dplyr::arrange(stringr::str_to_lower(Project_name), Station_ID)
+    det_by_proj <- split(det_state, f = det_state$Project_name, drop = TRUE)
+  } else {
+    det_by_proj <- list()
+  }
+
+  # Which projects have deployments but no detections?
+  det_projects     <- names(det_by_proj)
+  missing_projects <- setdiff(all_projects, det_projects)
+
+  # Filter detection rows to stations present in camOp rownames (required by detectionHistory)
+  for (p in det_projects) {
+    camop <- CampOp.list[[s]][[p]]
+    if (is.null(camop)) next
+    allowed <- rownames(camop)
+    det_by_proj[[p]] <- det_by_proj[[p]] %>%
+      dplyr::filter(Station_ID %in% allowed)
+    # If all detections are filtered out, treat project as missing
+    if (nrow(det_by_proj[[p]]) == 0) {
+      missing_projects <- union(missing_projects, p)
+      det_by_proj[[p]] <- NULL
+    }
+  }
+
+  # Add exactly one placeholder (anchored at a valid deployment station) for zero-detection projects
+  if (preserve_zero_projects && length(missing_projects)) {
+    for (p in missing_projects) {
+      camop <- CampOp.list[[s]][[p]]
+      if (is.null(camop)) next
+      allowed <- rownames(camop)
+      if (length(allowed) == 0) next
+      # Use the first station in camOp for this project
+      stn <- allowed[1]
+      # Find a reasonable date from deployments (start date for that station); fallback = today
+      dep_proj_df <- sf::st_drop_geometry(cam_deploy_by_proj[[p]])
+      dep_stn     <- dplyr::filter(dep_proj_df, Station_ID == stn)
+      dt0         <- if (nrow(dep_stn) > 0) as.Date(dep_stn$Start_Deployment_date[1]) else Sys.Date()
+
+      det_by_proj[[p]] <- data.frame(
+        Project_name = p,
+        Species      = species_of_interest,
+        Station_ID   = stn,
+        Date_Time2   = paste0(as.character(dt0), " 01:42:00"),
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+
+  # -------------------- Build detection histories per project --------------------
+  DetHist_state <- vector("list", length(all_projects))
+  names(DetHist_state) <- all_projects
+
+  for (p in all_projects) {
+    camop <- CampOp.list[[s]][[p]]
+    if (is.null(camop)) next
+    rt <- det_by_proj[[p]]
+    if (is.null(rt) || nrow(rt) == 0) next
+
+    # Final guard: keep only stations present in camOp
+    rt <- rt[rt$Station_ID %in% rownames(camop), , drop = FALSE]
+    if (nrow(rt) == 0) next
+
+    DetHist_state[[p]] <- camtrapR::detectionHistory(
+      recordTable          = rt,
+      camOp                = camop,
+      stationCol           = "Station_ID",
+      speciesCol          = "Species",
+      recordDateTimeCol    = "Date_Time2",
+      species              = species_of_interest,
+      occasionLength       = occasion_length,
+      day1                 = "station",
+      datesAsOccasionNames = FALSE,
+      includeEffort        = FALSE,
+      timeZone             = tz_local
+    )
+  }
+
+  # Zero-out placeholders to preserve all-zero projects (matrix exists, but counts remain correct)
+  if (preserve_zero_projects && length(missing_projects)) {
+    for (p in missing_projects) {
+      if (!is.null(DetHist_state[[p]])) {
+        dh <- DetHist_state[[p]]$detection_history
+        dh[dh == 1] <- 0
+        DetHist_state[[p]]$detection_history <- dh
+      }
+    }
+  }
+
+  # Store per-project results for this state
+  DetHist[[s]] <- DetHist_state
+}
+
+# ---- Optional: quick structure check (uncomment to verify) ----
+# lengths_per_state <- vapply(DetHist, function(x) length(Filter(Negate(is.null), x)), integer(1))
+# print(lengths_per_state)   # expected something like c(1, 2, 6, 4)
+```
+
+## 13) Build camera matrices `O.o` (detections) and `O.o2` (effort)
+```{r build-oo}
+
+#Build O.o (detections: 0/1/NA) and O.o2 (effort: 1/0) per state
+O.o  <- vector("list", length(DetHist)); names(O.o)  <- names(DetHist)
+O.o2 <- vector("list", length(DetHist)); names(O.o2) <- names(DetHist)
+df.list <- vector("list", length(DetHist))
+
+for (s in seq_along(DetHist)) {
+  # If no projects in this state, store empty 0x0 matrices and continue
+  if (length(DetHist[[s]]) == 0) {
+    O.o[[s]]  <- matrix(numeric(0), 0, 0)
+    O.o2[[s]] <- matrix(numeric(0), 0, 0)
+    next
+  }
+
+  # Row-bind project detection_history matrices; ldply adds an '.id' column by default
+  df.list[[s]] <- plyr::ldply(
+    DetHist[[s]],
+    function(x) as.data.frame(x$detection_history),
+    .id = ".id"
+  )
+
+  # Drop the id column (robustly)
+  dh_df <- df.list[[s]]
+  if (".id" %in% names(dh_df)) {
+    dh_df <- dh_df[, setdiff(names(dh_df), ".id"), drop = FALSE]
+  } else if (!is.numeric(dh_df[[1]])) {
+    # Fallback: if first column isn't numeric, drop it
+    dh_df <- dh_df[, -1, drop = FALSE]
+  }
+
+  # Coerce to numeric matrix
+  mat <- suppressWarnings(as.matrix(dh_df))
+  storage.mode(mat) <- "numeric"   # non-numeric cells become NA
+
+  # Restrict to {0, 1, NA}: any non-zero (and non-NA) becomes 1; zeros stay 0; NAs stay NA
+  mat[!is.na(mat) & mat != 0] <- 1
+
+  # Save detections matrix (0/1/NA)
+  O.o[[s]] <- mat
+
+  # Effort matrix (1 where not NA, else 0) — optional but included for completeness
+  eff <- mat
+  eff[!is.na(eff)] <- 1
+  eff[is.na(eff)]  <- 0
+  O.o2[[s]] <- eff
+}
+
+# Optional sanity checks
+# str(O.o[[1]]); str(O.o2[[1]])
+# table(O.o[[1]], useNA = "ifany")
+
+```
+
+
+```{r}
+## ---- Build Y.o (camera detections by state; alias of O.o) ----
+## Goal: 6-slot list named "1".."6" so downstream code always has all state slots.
+## Semantics: Y.o[[s]] = O.o[[s]] when cameras exist in state s; else NULL.
+
+state_ids <- as.character(1:6)
+
+# Ensure O.o is keyed by state id strings; we built it using names(DetHist),
+# which are the states that actually have deployments (e.g., "3","4","5","6").
+# We'll expand that into a full 6-slot Y.o.
+Y.o <- setNames(vector("list", length(state_ids)), state_ids)
+
+for (s in state_ids) {
+  if (!is.null(O.o[[s]]) && length(O.o[[s]]) > 0) {
+    Y.o[[s]] <- O.o[[s]]
+  } else {
+    # keep NULL (as your original script did for states without cameras)
+    Y.o[[s]] <- NULL
+  }
+}
+
+# (Optional) If you prefer empty 0x0 matrices instead of NULLs, replace the "else" with:
+# Y.o[[s]] <- matrix(numeric(0), 0, 0)
+```
+
+## Coordinates for SCR (km -> m)
+```{r scr-inputs}
+# DNA traps (X1) and Cameras (X2)
+Traps_list <- purrr::imap(DNA_short_list, ~ .x |>
+  dplyr::select(Project_name, Station_ID, UTM_X, UTM_Y) |>
+  sf::st_drop_geometry() |>
+  dplyr::arrange(stringr::str_to_lower(Project_name), Station_ID) |>
+  dplyr::distinct() |>
+  dplyr::select(UTM_X, UTM_Y) |>
+  as.matrix() / coord_scale_km)
+
+cam_list <- purrr::imap(cam_short_list, ~ .x |>
+  dplyr::select(Station_ID, UTM_X, UTM_Y) |>
+  sf::st_drop_geometry() |>
+  dplyr::distinct() |>
+  dplyr::select(UTM_X, UTM_Y) |>
+  as.matrix() / coord_scale_km)
+
+# Expect exactly 6 states named "1","2","3","4","5","6"
+n_state_space <- 6
+state_ids <- as.character(1:n_state_space)
+
+# empty 0x2 matrix placeholder (km)
+make_empty_xy_km <- function() {
+  matrix(numeric(0), nrow = 0, ncol = 2,
+         dimnames = list(NULL, c("UTM_X","UTM_Y")))
+}
+
+# Ensure Traps_list has entries for all 6 states, in order
+Traps_list <- setNames(Traps_list[state_ids], state_ids)
+Traps_list <- purrr::imap(Traps_list, ~ if (is.null(.x)) make_empty_xy_km() else .x)
+
+# Ensure cam_list has entries for all 6 states, in order
+cam_list <- setNames(cam_list[state_ids], state_ids)
+cam_list <- purrr::imap(cam_list, ~ if (is.null(.x)) make_empty_xy_km() else .x)
+
+## ---- Bounds per state (simple, programmatic; 50 km padding; km units) ----
+
+# Assumes:
+# - state_ids <- as.character(1:n_state_space) already defined
+# - Traps_list and cam_list are lists of length 6 (states "1".."6"), each entry is a
+#   0x2 or Nx2 matrix in KM with columns UTM_X, UTM_Y (as in your current setup)
+
+# Helper: combine two XY matrices; return 0x2 if both empty
+combine_xy <- function(a, b) {
+  # Coerce NULLs to 0x2 matrices
+  to_xy <- function(m) {
+    if (is.null(m) || length(m) == 0) {
+      out <- matrix(numeric(0), nrow = 0, ncol = 2)
+      colnames(out) <- c("UTM_X","UTM_Y")
+      return(out)
+    }
+    # ensure numeric 2 cols with names
+    m <- as.matrix(m[, 1:2, drop = FALSE])
+    storage.mode(m) <- "numeric"
+    if (is.null(colnames(m))) colnames(m) <- c("UTM_X","UTM_Y")
+    m
+  }
+  a <- to_xy(a); b <- to_xy(b)
+  if (nrow(a) == 0 && nrow(b) == 0) return(a)
+  if (nrow(a) == 0) return(b)
+  if (nrow(b) == 0) return(a)
+  rbind(a, b)
+}
+
+# Compute bounds with +/- 50 km padding
+compute_bounds_km <- function(m, pad_km = 50) {
+  if (is.null(m) || nrow(m) == 0) {
+    return(list(xlim = c(NA_real_, NA_real_), ylim = c(NA_real_, NA_real_), area = NA_real_))
+  }
+  x <- m[, 1]; y <- m[, 2]
+  xmin <- min(x, na.rm = TRUE) - pad_km
+  xmax <- max(x, na.rm = TRUE) + pad_km
+  ymin <- min(y, na.rm = TRUE) - pad_km
+  ymax <- max(y, na.rm = TRUE) + pad_km
+  list(
+    xlim = c(xmin, xmax),
+    ylim = c(ymin, ymax),
+    area = (xmax - xmin) * (ymax - ymin)
+  )
+}
+
+# Build per-state combined XY (traps ∪ cameras within the same state), then bounds
+xlim.list <- setNames(vector("list", length(state_ids)), state_ids)
+ylim.list <- setNames(vector("list", length(state_ids)), state_ids)
+Area.list <- setNames(vector("list", length(state_ids)), state_ids)
+
+for (s in state_ids) {
+  xy_s <- combine_xy(Traps_list[[s]], cam_list[[s]])   # per-state union (no cross-state assumptions)
+  b    <- compute_bounds_km(xy_s, pad_km = 50)
+  xlim.list[[s]] <- b$xlim
+  ylim.list[[s]] <- b$ylim
+  Area.list[[s]] <- b$area
+}
+
+# Convenience 6x2 matrices (km) and a named area vector (km^2)
+xlims <- do.call(rbind, xlim.list); rownames(xlims) <- state_ids
+ylims <- do.call(rbind, ylim.list); rownames(ylims) <- state_ids
+Areas <- setNames(
+  vapply(Area.list, function(z) if (length(z)) z else NA_real_, numeric(1)),
+  state_ids
+)
+
+# Optional checks
+# print(xlims); print(ylims); print(Areas)
+
+# Build X1 (DNA traps) and X2 (cameras) in meters (km -> m), preserving 6 slots
+X1 <- purrr::map(Traps_list, ~ .x * 1000)
+X2 <- purrr::map(cam_list,   ~ .x * 1000)
+
+# Sanity checks
+stopifnot(length(X1) == 6, length(X2) == 6)
+stopifnot(identical(names(X1), state_ids), identical(names(X2), state_ids))
+```
+
+#Final map
+
+```{r}
+# --- INPUT ASSUMPTIONS (already loaded in your session) ---
+# columbian_area          : sf POLYGON(s) for the broader region
+# subpopulations          : sf POLYGON(s) with column 'Subpop'
+# DNA_states              : sf POINT(s) with column 'State.x' (DNA sites)
+# cameras_grid_states     : sf POINT(s) with column 'State'   (camera sites)
+# state_spaces (optional) : sf POLYGON(s) with 'session' or 'State' per state space
+# xlim, ylim (optional)   : 6x2 matrices with session extents; may be meters or kilometers
+
+# --- 1) Transform ALL layers to a projected CRS (meters) for clean zooming ---
+# (BC Albers is EPSG:3005; adjust if you use a different project CRS)
+target_crs <- 3005
+columbian_area       <- st_transform(columbian_area, target_crs)
+subpopulations       <- st_transform(subpopulations, target_crs)
+DNA_states           <- st_transform(DNA_states, target_crs)
+cameras_grid_states  <- st_transform(cameras_grid_states, target_crs)
+if (exists("state_spaces")) {
+  state_spaces <- st_transform(state_spaces, target_crs)
+}
+
+# --- 2) Harmonize and lock the state factor levels across layers ---
+# Rename DNA 'State.x' -> 'State' so both use the same aesthetic.
+DNA_states2 <- DNA_states %>% dplyr::select(-State) %>%  dplyr::rename(State = State.x)
+# 
+
+#optiona--(save to shapefile for ESRI map)--
+#st_write(DNA_states2, "DNA_states.gpkg", layer = "points", delete_layer = TRUE)
+st_write(cameras_grid_states, "cameras_grid_states.gpkg", layer = "points", delete_layer = TRUE)
+
+# Build a shared, explicit set of state levels from BOTH layers (order fixed).
+state_levels <- sort(unique(c(
+  as.character(DNA_states2$State),
+  as.character(cameras_grid_states$State)
+)))
+
+# Relevel both layers to use the same factor levels (prevents palette mismatches).
+DNA_states2$State          <- factor(as.character(DNA_states2$State), levels = state_levels)
+cameras_grid_states$State  <- factor(as.character(cameras_grid_states$State), levels = state_levels)
+
+# --- 3) Define a single shared color palette for states & apply it everywhere ---
+# You can swap to viridis or ColorBrewer if you prefer.
+pal <- scales::hue_pal()(length(state_levels))
+names(pal) <- state_levels
+
+shared_color_scale <- scale_color_manual(
+  name   = "State",
+  values = pal,
+  breaks = state_levels,
+  limits = state_levels,
+  drop   = FALSE
+)
+
+# --- 4) Build the main map (pp) using the shared color scale ---
+pp <- ggplot() +
+  geom_sf(data = columbian_area, fill = NA, color = "grey50") +
+  geom_sf(
+    data = dplyr::filter(subpopulations, Subpop != "Boreal"),
+    aes(fill = Subpop), alpha = 0.5
+  ) +
+  geom_sf(
+    data = DNA_states2,
+    aes(color = State),
+    size = 1.5, shape= 1
+  ) +
+  geom_sf(
+    data = cameras_grid_states,
+    aes(color = State),
+    size = 1, shape = 3, stroke = 1.1   # rings for cameras
+  ) +
+  shared_color_scale +                     # << enforce the exact same colors
+  ggtitle("DNA (points) and Cameras (cross) by State Space") +
+  theme_minimal(base_size = 11) +
+  guides(
+    color = guide_legend(title = "State"),
+    fill  = guide_legend(title = "Subpopulation"))+
+    theme(
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    panel.background = element_blank()
+  )
+
+# --- 5) Helper: Zoom panel function (same palette + robust extents + sf-native jitter) ---
+make_zoom_plot <- function(
+  g,
+  xlim_mat = NULL, ylim_mat = NULL,        # optional matrices (6x2)
+  extents_in_km = FALSE,                   # set TRUE if your xlim/ylim are in kilometers
+  dna_sf = DNA_states2,                    # sf POINTS with 'State'
+  cams_sf = cameras_grid_states,           # sf POINTS with 'State'
+  state_poly = NULL,                       # optional sf POLYGON(s) with 'session' or 'State'
+  title_prefix = "State space",
+  jitter_amount = 10,                      # meters; requires projected CRS
+  min_pad = 400                            # minimum panel width/height in meters
+) {
+  # Subset per state/session (g)
+  dna_g  <- dna_sf  |> dplyr::filter(State == state_levels[g])
+  cams_g <- cams_sf |> dplyr::filter(State == state_levels[g])
+
+  # Optional: corresponding state polygon/boundary
+  poly_g <- NULL
+  if (!is.null(state_poly) && inherits(state_poly, "sf")) {
+    if ("session" %in% names(state_poly)) {
+      # If sessions map 1..6 to the same order as state_levels, you can match by index here.
+      poly_g <- state_poly |> dplyr::filter(session == g)
+    } else if ("State" %in% names(state_poly)) {
+      poly_g <- state_poly |> dplyr::filter(State == state_levels[g])
+    }
+  }
+
+  # Light jitter to separate coincident points (in meters)
+  if (nrow(dna_g) > 0 && jitter_amount > 0)  dna_g  <- sf::st_jitter(dna_g,  amount = jitter_amount)
+  if (nrow(cams_g) > 0 && jitter_amount > 0) cams_g <- sf::st_jitter(cams_g, amount = jitter_amount)
+
+  # Decide zoom extents:
+  use_mats <- !is.null(xlim_mat) && !is.null(ylim_mat) &&
+              (is.matrix(xlim_mat) || is.data.frame(xlim_mat)) &&
+              (is.matrix(ylim_mat) || is.data.frame(ylim_mat)) &&
+              nrow(as.data.frame(xlim_mat)) >= g && nrow(as.data.frame(ylim_mat)) >= g
+
+  if (use_mats) {
+    xlim_use <- as.numeric(xlim_mat[g, ])
+    ylim_use <- as.numeric(ylim_mat[g, ])
+    if (isTRUE(extents_in_km)) {
+      xlim_use <- xlim_use * 1000
+      ylim_use <- ylim_use * 1000
+    }
+  } else {
+    # Fallback: bbox from available layers for this state
+    candidates <- list(dna_g, cams_g, poly_g)
+    bxs <- lapply(candidates, function(x) if (inherits(x, "sf") && nrow(x) > 0) sf::st_bbox(x) else NULL)
+    bxs <- Filter(Negate(is.null), bxs)
+    if (length(bxs) == 0) stop(sprintf("No data to determine bbox for state/session %d", g))
+    xlim_use <- range(sapply(bxs, function(b) c(b["xmin"], b["xmax"])))
+    ylim_use <- range(sapply(bxs, function(b) c(b["ymin"], b["ymax"])))
+  }
+
+  # Ensure spans aren’t degenerate; pad tiny ranges
+  pad_if_tiny <- function(lims, min_pad) {
+    span <- diff(lims)
+    if (!is.finite(span) || span < min_pad) {
+      mid <- mean(lims)
+      return(c(mid - min_pad/2, mid + min_pad/2))
+    }
+    pad <- span * 0.05
+    c(lims[1] - pad, lims[2] + pad)
+  }
+  xlim_use <- pad_if_tiny(xlim_use, min_pad = min_pad)
+  ylim_use <- pad_if_tiny(ylim_use, min_pad = min_pad)
+
+  # Build the zoom panel with the SAME color scale
+  pz <- ggplot()
+  if (!is.null(poly_g) && nrow(poly_g) > 0) {
+    pz <- pz + geom_sf(data = poly_g, fill = NA, color = "black", linewidth = 0.5)
+  }
+  if (nrow(dna_g) > 0) {
+    pz <- pz + geom_sf(data = dna_g, aes(color = State), shape= 1, size = 1)
+  }
+  if (nrow(cams_g) > 0) {
+    pz <- pz + geom_sf(data = cams_g, color= 'black', size = 0.5, shape = 3, stroke = 1)
+  }
+
+ # show longitude/latitude ticks in panes (axes in degrees) ---
+
+# 1) Build a rectangle (in your projected CRS) from the current x/y limits:
+rect_proj <- sf::st_as_sfc(sf::st_bbox(
+  c(xmin = xlim_use[1], xmax = xlim_use[2],
+    ymin = ylim_use[1], ymax = ylim_use[2]),
+  crs = sf::st_crs(target_crs)   # <- your projected CRS (e.g., 3005)
+))
+
+# 2) Transform that rectangle to geographic (EPSG:4326):
+rect_geo <- sf::st_transform(rect_proj, 4326)
+bb_geo   <- sf::st_bbox(rect_geo)  # now in lon/lat
+
+# 3) Plot with geographic axes but keep geometries as-is (projected):
+pz +
+  #shared_color_scale +
+  coord_sf(
+    crs  = sf::st_crs(4326),                        # axes in lon/lat
+    xlim = c(bb_geo["xmin"], bb_geo["xmax"]),       # degrees
+    ylim = c(bb_geo["ymin"], bb_geo["ymax"]),       # degrees
+    expand = FALSE,
+    label_graticule = "EWNS"                         # optional: label all sides
+  ) +
+  # 4) (Optional) fewer, cleaner longitude labels:
+  scale_x_continuous(breaks = scales::breaks_extended(n = 3),
+                     labels = function(x) paste0(round(x, 3), "°")) +
+  scale_y_continuous(breaks = scales::breaks_extended(n = 3),
+                     labels = function(x) paste0(round(x, 3), "°")) +
+  ggtitle(sprintf("%s %s", title_prefix, state_levels[g])) +
+  theme_minimal(base_size = 10) +
+  theme(
+    legend.position   = "none",
+    plot.title        = element_text(face = "bold", hjust = 0.5),
+    panel.grid.major  = element_line(linewidth = 0.1, color = "grey85"),
+    axis.text         = element_text(size = 8),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    panel.background = element_blank()
+  )
+  
+}
+pp
+```
+
+```{r}
+# --- Number of panes: use 6 or the number of distinct states you want to show ---
+N.session <- min(6, length(state_levels))
+
+# OPTIONAL: If you have xlim/ylim from SCR prep in the SAME CRS, pass them here.
+# If those extents are in kilometers, set extents_in_km = TRUE below.
+xlim_mat <- if (exists("xlim") && (is.matrix(xlim) || is.data.frame(xlim))) xlim else NULL
+ylim_mat <- if (exists("ylim") && (is.matrix(ylim) || is.data.frame(ylim))) ylim else NULL
+
+zoom_list <- lapply(seq_len(N.session), function(g) {
+  make_zoom_plot(
+    g = g,
+    xlim_mat = xlim_mat,
+    ylim_mat = ylim_mat,
+    extents_in_km = TRUE,     # <-- set TRUE if your xlim/ylim are in kilometers
+    dna_sf = DNA_states2,
+    cams_sf = cameras_grid_states,
+    state_poly = if (exists("state_spaces")) state_spaces else NULL,
+    title_prefix = "State space",
+    jitter_amount = 10,        # increase to 20–30 if points still overlap
+    min_pad = 400              # broaden tiny extents to at least 400 m
+  )
+})
+
+# --- Arrange six panes (2 columns), then combine with the main map ---
+right_panel <- cowplot::plot_grid(
+  plotlist = zoom_list,
+  ncol = 2,
+  align = "hv"
+)
+
+combined <- cowplot::plot_grid(
+  pp, right_panel,
+  ncol = 2,
+  rel_widths = c(1.3, 1)   # make main map a bit wider than the panes
+)
+
+# Show it
+print(combined)
+
+# Save it
+ggsave("DNA_Cameras_with_6_zoom_panes_matched_colors.png",
+       combined, width = 14, height = 8, dpi = 300)
+```
+
+
+## Save workspace
+```{r save}
+if (!dir.exists(dirname(paths$save_rdata_winter))) dir.create(dirname(paths$save_rdata_winter), recursive = TRUE, showWarnings = FALSE)
+if (!dir.exists(dirname(paths$save_rdata_all))) dir.create(dirname(paths$save_rdata_all), recursive = TRUE, showWarnings = FALSE)
+
+if (identical(season, "winter")) {
+  save.image(file = paths$save_rdata_winter)
+  cat("Saved:", paths$save_rdata_winter, "\n")
+} else {
+  save.image(file = paths$save_rdata_all)
+  cat("Saved:", paths$save_rdata_all, "\n")
+}
+```
+
+
+## Summary stations
+```{r}
+## ---- summary-stations, message=FALSE, warning=FALSE ---------------------
+
+# Optional: set to TRUE to limit counts to stations within the Columbian AOI.
+count_within_aoi <- FALSE
+
+# Helper to intersect with AOI if requested and available
+maybe_intersect_aoi <- function(sf_obj, do_intersect = FALSE, aoi = NULL) {
+  if (!do_intersect) return(sf_obj)
+  if (!inherits(sf_obj, "sf") || is.null(aoi) || !inherits(aoi, "sf")) return(sf_obj)
+  tryCatch(sf::st_intersection(sf_obj, aoi), error = function(e) sf_obj)
+}
+
+# 1) Prepare unique station tables (1 row per Station_ID)
+dna_sf_use <- maybe_intersect_aoi(DNA_states, do_intersect = count_within_aoi, aoi = columbian_area)
+cam_sf_use <- cameras_grid_states  # already AOI-filtered upstream
+
+dna_sites <- dna_sf_use |>
+  sf::st_drop_geometry() |>
+  dplyr::filter(!is.na(Station_ID)) |>
+  dplyr::distinct(Station_ID, .keep_all = TRUE)
+
+cam_sites <- cam_sf_use |>
+  sf::st_drop_geometry() |>
+  dplyr::filter(!is.na(Station_ID)) |>
+  dplyr::distinct(Station_ID, .keep_all = TRUE)
+
+# 2) Totals
+n_dna_total <- nrow(dna_sites)
+n_cam_total <- nrow(cam_sites)
+n_dna_total
+n_cam_total
+
+# Helper: numeric key for sorting states like "State 1", "S-2", etc.
+state_key <- function(x) suppressWarnings(as.integer(readr::parse_number(as.character(x))))
+
+# 3) By State
+dna_by_state <- dna_sites |>
+  dplyr::mutate(State = dplyr::coalesce(as.character(State.x), as.character(State))) |>
+  dplyr::mutate(State = ifelse(is.na(State) | State == "", "Unassigned", State)) |>
+  dplyr::count(State, name = "n_DNA_stations") |>
+  dplyr::arrange(state_key(State))
+
+cam_by_state <- cam_sites |>
+  dplyr::mutate(State = ifelse(is.na(State) | State == "", "Unassigned", as.character(State))) |>
+  dplyr::count(State, name = "n_camera_traps") |>
+  dplyr::arrange(state_key(State))
+
+by_state <- dplyr::full_join(dna_by_state, cam_by_state, by = "State") |>
+  dplyr::mutate(
+    n_DNA_stations  = dplyr::coalesce(n_DNA_stations, 0L),
+    n_camera_traps  = dplyr::coalesce(n_camera_traps, 0L)
+  ) |>
+  dplyr::arrange(state_key(State))
+by_state
+
+# 4) By Project (unchanged)
+dna_by_project <- dna_sites |>
+  dplyr::mutate(Project_name = ifelse(is.na(Project_name) | Project_name == "", "Unassigned", Project_name)) |>
+  dplyr::count(Project_name, name = "n_DNA_stations") |>
+  dplyr::arrange(dplyr::desc(n_DNA_stations), Project_name)
+dna_by_project
+```
+
+## Summary 2
+```{r}
+## ---- camera_active_window_and_summary, message=FALSE, warning=FALSE ----
+
+# Pick the camera table you already created (after filtering/exclusions)
+cam_df <- cameras_grid_short1   # or: cam_df <- cameras_grid_states
+
+# Ensure dates are Date, and drop rows without both dates
+cam_df <- cam_df |>
+  dplyr::mutate(
+    Start_Deployment_date = as.Date(Start_Deployment_date),
+    End_Deployment_date   = as.Date(End_Deployment_date)
+  ) |>
+  dplyr::filter(!is.na(Start_Deployment_date), !is.na(End_Deployment_date))
+
+# Guard: if nothing remains, stop early with a helpful message
+if (nrow(cam_df) == 0) stop("No camera deployments with valid start/end dates found in cam_df.")
+
+# ---- Global active window (for narrative text) ----
+active_start <- min(cam_df$Start_Deployment_date, na.rm = TRUE)
+active_end   <- max(cam_df$End_Deployment_date,   na.rm = TRUE)
+
+# Nicely formatted for manuscript text (Month YYYY)
+active_start_fmt <- format(active_start, "%B %Y")
+active_end_fmt   <- format(active_end,   "%B %Y")
+
+# ---- Effort per station (camera-days) and summary stats ----
+cam_df <- cam_df |>
+  dplyr::mutate(camera_days = as.integer(End_Deployment_date - Start_Deployment_date + 1L)) |>
+  dplyr::filter(camera_days > 0)
+
+j_traps <- nrow(cam_df)
+
+eff_min    <- min(cam_df$camera_days, na.rm = TRUE)
+eff_max    <- max(cam_df$camera_days, na.rm = TRUE)
+eff_mean   <- round(mean(cam_df$camera_days, na.rm = TRUE), 1)
+eff_median <- median(cam_df$camera_days, na.rm = TRUE)
+eff_q1     <- as.numeric(quantile(cam_df$camera_days, 0.25, na.rm = TRUE))
+eff_q3     <- as.numeric(quantile(cam_df$camera_days, 0.75, na.rm = TRUE))
+
+# ------------------------------------------------------------------
+# k from analysis matrices, not global span
+# ------------------------------------------------------------------
+
+# Report k directly from the analysis matrices
+K_state <- vapply(O.o, function(m) if (length(m)) ncol(m) else 0L, integer(1))
+k_biweekly <- max(K_state, na.rm = TRUE)
+
+# Optionally, also compute effort stats from the capped deployments
+eff_cap_days <- deploy_df_cap %>%
+  dplyr::mutate(camera_days = as.integer(End_Deployment_date - Start_Deployment_date + 1L)) %>%
+  dplyr::filter(camera_days > 0)
+
+j_traps  <- nrow(eff_cap_days)
+eff_min  <- min(eff_cap_days$camera_days, na.rm = TRUE)
+eff_max  <- max(eff_cap_days$camera_days, na.rm = TRUE)
+eff_mean <- round(mean(eff_cap_days$camera_days, na.rm = TRUE), 1)
+
+active_start_fmt <- format(min(eff_cap_days$Start_Deployment_date, na.rm = TRUE), "%B %Y")
+active_end_fmt   <- format(max(eff_cap_days$End_Deployment_date,   na.rm = TRUE), "%B %Y")
+
+# ---- Output: a one-line sentence ready to paste into Methods ----
+cat("\n### Camera survey window & summary\n\n")
+cat(sprintf(
+  "Camera surveys were active from %s to %s, with effort ranging from %s to %s camera-days (mean = %s camera-days). ",
+  active_start_fmt,
+  active_end_fmt,
+  format(eff_min, big.mark = ","),
+  format(eff_max, big.mark = ","),
+  format(eff_mean, big.mark = ",")
+))
+cat(sprintf(
+  "We aggregated detections bi-weekly to construct an occupancy matrix (j = %s traps; k = %s bi-weekly occasions).",
+  format(j_traps, big.mark = ","),
+  k_biweekly
+))
+cat("\n")
+
+# (Optional) return a list invisibly if you want to use values programmatically later
+invisible(list(
+  active_start = active_start_fmt,
+  active_end   = active_end_fmt,
+  j_traps      = j_traps,
+  k_biweekly   = k_biweekly,
+  eff_stats    = c(
+    min = eff_min, q1 = eff_q1, median = eff_median,
+    mean = eff_mean, q3 = eff_q3, max = eff_max
+  )
+))
+```
+
+#Table 1 
+```{r}
+## ==== Camera & DNA project × state summaries (consistent with Y.o) ====
+
+# Packages
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(stringr)
+library(purrr)
+library(tibble)
+library(knitr)
+
+# Small helper for NULL-coalescing (used for DNA dates)
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# ---- 0) Canonical mapping: State -> SS[x] label + Subpopulation ----
+canon_map <- tibble::tibble(
+  State = 1:6,
+  StateSpace = paste0("SS[", State, "]"),
+  Subpopulation = c("Omineca","Omineca","Omineca","Omineca","Chilcotin","Cariboo")
+)
+
+# Helper: format "Year used"
+fmt_year_used <- function(start_vec, end_vec) {
+  s <- suppressWarnings(lubridate::as_date(start_vec))
+  e <- suppressWarnings(lubridate::as_date(end_vec))
+  y1 <- year(s); y2 <- year(e)
+  out <- ifelse(is.finite(y1) & is.finite(y2),
+                ifelse(y1 == y2, as.character(y1), paste0(y1, "–", y2)),
+                "unknown")
+  out
+}
+
+# =======================================================================================
+# 1) CAMERA TABLE — project × state, with TotalDetections pulled from DetHist (→ Y.o)
+# =======================================================================================
+
+# Use the capped deployments if available (as in your pipeline)
+cam_deploy_use <- if (exists("deploy_df_cap")) deploy_df_cap else cameras_grid_states
+
+# Keep needed columns and coerce dates
+cam_deploy_use <- cam_deploy_use %>%
+  sf::st_drop_geometry() %>%
+  mutate(
+    Start_Deployment_date = suppressWarnings(as.Date(Start_Deployment_date)),
+    End_Deployment_date   = suppressWarnings(as.Date(End_Deployment_date))
+  )
+
+# ---- Pull total detections from DetHist (post-filtered & collapsed exactly as for Y.o) ----
+# DetHist is list over states; each element is a named list over projects, each having $detection_history
+extract_cam_detections <- function(DetHist_state) {
+  if (length(DetHist_state) == 0) {
+    return(tibble(Project_name = character(0), TotalDetections = integer(0)))
+  }
+  purrr::imap_dfr(DetHist_state, function(x, project) {
+    if (is.null(x) || is.null(x$detection_history)) {
+      tibble(Project_name = project, TotalDetections = 0L)
+    } else {
+      mat <- x$detection_history
+      tibble(
+        Project_name = project,
+        TotalDetections = sum(mat, na.rm = TRUE)
+      )
+    }
+  })
+}
+
+# Build a state-indexed tibble of detections from DetHist
+cam_det_tbl <- purrr::imap_dfr(DetHist, function(DetHist_state, state_id) {
+  extract_cam_detections(DetHist_state) %>%
+    mutate(State = suppressWarnings(as.integer(state_id)))
+})
+
+# Summaries per project×state from deployments
+camera_table <- cam_deploy_use %>%
+  filter(!is.na(Project_name), !is.na(State)) %>%
+  group_by(State, Project_name) %>%
+  summarise(
+    `Number of stations` = n_distinct(Station_ID),
+    start_min  = suppressWarnings(min(Start_Deployment_date, na.rm = TRUE)),
+    end_max    = suppressWarnings(max(End_Deployment_date,   na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(`Year used` = fmt_year_used(start_min, end_max)) %>%
+  dplyr::select(State, Project_name, `Number of stations`, `Year used`) %>%
+  # Join detections from DetHist (truth used by Y.o)
+  left_join(cam_det_tbl, by = c("State","Project_name")) %>%
+  mutate(TotalDetections = dplyr::coalesce(TotalDetections, 0L)) %>%
+  # Add SS[x] and Subpopulation labels
+  left_join(canon_map, by = "State") %>%
+  transmute(
+    `Project name`  = Project_name,
+    Subpopulation,
+    `State Space`   = StateSpace,
+    `Number of stations`,
+    `Year used`,
+    `Total fisher detections` = TotalDetections
+  ) %>%
+  arrange(Subpopulation, `State Space`, `Project name`)
+
+cat("\n### Camera studies included (by project × state)\n")
+knitr::kable(camera_table,
+             caption = "Camera studies included — project × state summary (detections from DetHist / Y.o)",
+             align = "l")
+
+
+# =======================================================================================
+# 2) DNA TABLE — project × state, consistent with DNA pipeline / Y.s construction
+# =======================================================================================
+
+# Build per-project×state totals from the post-rules DNA sf table.
+# This aligns with how Y.s is built (from DNA_states after rules & state assignment).
+dna_det_tbl <- DNA_states %>%
+  sf::st_drop_geometry() %>%
+  mutate(State = dplyr::coalesce(as.integer(State), as.integer(State.x))) %>%
+  filter(!is.na(Project_name), !is.na(State)) %>%
+  mutate(is_fisher = Species == species_of_interest) %>%
+  group_by(State, Project_name) %>%
+  summarise(
+    `Total fisher detections` = sum(is_fisher, na.rm = TRUE),  # count fisher rows
+    `Number of stations`      = n_distinct(Station_ID),
+    # Prefer Start_date / End_date if available; otherwise try a single Date column
+    start_min = suppressWarnings(min(as.Date(Start_date %||% NA), as.Date(End_date %||% NA), na.rm = TRUE)),
+    end_max   = suppressWarnings(max(as.Date(End_date   %||% NA), as.Date(Start_date %||% NA), na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# If Start_date/End_date are absent or NA, try fallback Date column if it exists
+if (any(is.na(dna_det_tbl$start_min)) || any(is.na(dna_det_tbl$end_max))) {
+  if ("Date" %in% names(sf::st_drop_geometry(DNA_states))) {
+    dna_dates_alt <- DNA_states %>%
+      sf::st_drop_geometry() %>%
+      mutate(State = dplyr::coalesce(as.integer(State), as.integer(State.x))) %>%
+      filter(!is.na(Project_name), !is.na(State)) %>%
+      mutate(Date_alt = suppressWarnings(as.Date(Date))) %>%
+      group_by(State, Project_name) %>%
+      summarise(
+        start_min_alt = min(Date_alt, na.rm = TRUE),
+        end_max_alt   = max(Date_alt, na.rm = TRUE),
+        .groups = "drop"
+      )
+    dna_det_tbl <- dna_det_tbl %>%
+      left_join(dna_dates_alt, by = c("State","Project_name")) %>%
+      mutate(
+        start_min = ifelse(is.finite(start_min), start_min, start_min_alt),
+        end_max   = ifelse(is.finite(end_max),   end_max,   end_max_alt)
+      ) %>%
+      dplyr::select(-start_min_alt, -end_max_alt)
+  }
+}
+
+dna_table <- dna_det_tbl %>%
+  mutate(`Year used` = fmt_year_used(start_min, end_max)) %>%
+  left_join(canon_map, by = "State") %>%
+  transmute(
+    `Project name`  = Project_name,
+    Subpopulation,
+    `State Space`   = StateSpace,
+    `Number of stations`,
+    `Year used`     = dplyr::if_else(is.na(`Year used`) | `Year used` == "", "unknown", `Year used`),
+    `Total fisher detections`
+  ) %>%
+  arrange(Subpopulation, `State Space`, `Project name`)
+
+cat("\n### DNA studies included (by project × state)\n")
+knitr::kable(dna_table,
+             caption = "DNA studies included — project × state summary (aligned with Y.s pipeline)",
+             align = "l")
+
+
+```
+
+## Session info
+```{r session}
+sessionInfo()
+```

@@ -1,0 +1,748 @@
+---
+title: "5 State-space Verification & Data Packaging for Fisher SCR–Camera Integration"
+author: "Prepared for new analysts"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+  word_document: default
+---
+
+# Notes
+If you need to change covariates, there are smoothed variables saved on *I:\Ecosystems\Conservation Science\Species\Mesocarnivores\Projects\MMP\3.Analysis_Conceptual\Comm_occ\3. GIS\1km*
+
+If you need to smooth a new raster you can run the script #2 on the folder *I:\Ecosystems\Conservation Science\Species\Mesocarnivores\Projects\MMP\3.Analysis_Conceptual\Comm_occ\1. Scripts*
+
+```{r parameters}
+# change to project root or use a relative path like "SCR_Dcov_IntegratedRamsey"
+path_root <- "C:/LocalR/SCR_Dcov_IntegratedRamsey/2. GIS"
+out_root <- "C:/LocalR/SCR_Dcov_IntegratedRamsey/3. Outputs"
+input_rdata <- "Process_Fisher_camera-DNA_allseasons_March.RData" # or "Fisher_camera-DNA_winter-only_Jan_pl.RData"
+in_rdata <- file.path(out_root, input_rdata)
+stopifnot(file.exists(in_rdata))
+load(in_rdata)
+
+# ======= PATHS & INPUTS =======
+
+lakes_raster_path <- "lakes30k_120.tif"
+#smoothed_1km_path <- "Soil_Moisture_Average_1km.tif"  ## add your covariate data
+#smoothed_1km_path <- "CA_forest_age_2022_AOI_buffered_1km.tif" 
+smoothed_1km_path <- "CA_canopy_cover_2022_AOI_buffered_1km.tif" 
+# raw elevation raster is optional since we use the smoothed layer directly
+# elev_raster_path <- "elevation_120.tif"
+
+# ======= WORKFLOW OPTIONS =======
+make_pdfs <- TRUE                  # write summary PDFs
+output_prefix <- "Fisher_fcover"              # Change here if you change the variable as well
+buffer_m <- 12000                   # 12 km buffer around traps/cameras for state-space
+grid_res_m <- 1000                  # state-space grid resolution (cell side length)
+zoom_bounds <- c(800000, 1420000, 600000, 1300000)  # xmin, xmax, ymin, ymax for overview plots
+
+# ======= CAMERA INCLUSION POLICY =======
+# "auto": include cameras per session only if X2 and Y.o are present and non-empty
+# "manual": use include_cams_manual below
+include_cams_policy <- "auto"
+include_cams_manual <- NULL      # manually define which state spaces are missing cameras e.g., c(FALSE, TRUE, TRUE, TRUE, TRUE, TRUE)
+
+# ======= DENSITY COVARIATE NA POLICY =======
+# "fill_zero": replace NA with 0 (interpreted as baseline after any scaling)
+# "mask": keep NA but rely on InSS to mask them out (risky if NA falls inside InSS)
+# "error": stop if any NA remains in D.cov.store[[g]]
+dcov_na_policy <- "fill_zero"
+
+# ======= OPTIONAL ELEVATION MASK (OFF BY DEFAULT) =======
+cov_mask_threshold <- NULL         # e.g., 1400 to exclude cells with elevation > 1400 m; NULL to skip
+treat_cov_na_as_bad <- TRUE        # if using elevation mask, treat NA elevation as excluded
+```
+
+
+# Overview & Purpose
+
+This document walks through the **state-space verification** and **data packaging** pipeline for integrating **DNA SCR (hair snare) and camera** detections across multiple sessions (state spaces).
+
+> **Key idea:** We compute a buffered state-space per session around traps/cameras, remove non-habitat (e.g., lakes), optionally restrict by elevation, extract per-cell density covariate values, and package everything into a `data[[g]]` structure used by Nimble.
+
+
+# Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+# knitr options
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 9, fig.height = 6)
+
+# Helpers to require packages without installing (installation requires internet/privileges)
+.require <- function(pkgs) {
+  for (p in pkgs) {
+    if (!requireNamespace(p, quietly = TRUE)) {
+      stop(sprintf("Package '%s' is required but not installed.", p))
+    }
+    suppressPackageStartupMessages(library(p, character.only = TRUE))
+  }
+}
+
+.require(c("sf", "raster", "cowplot", "ggplotify", "grid"))
+```
+
+
+# Configuration
+
+We build absolute paths from the **R parameters** defined above (no YAML `params` needed).
+
+```{r config}
+# Compose absolute/relative paths
+fp_lakes <- file.path(path_root, lakes_raster_path)
+fp_1km <- file.path(path_root, smoothed_1km_path)
+
+# Output basenames
+tag <- output_prefix
+out_pdf_sspace <- file.path(out_root, sprintf("%s_SSpace_.pdf", tag))
+out_pdf_recaps <- file.path(out_root, sprintf("recapture_plots_%s.pdf", tolower(tag)))
+out_rdata <- file.path(out_root, sprintf("Fit_data_%s.RData", tag))
+
+# Shorthand
+res_m <- grid_res_m
+zoom <- zoom_bounds
+
+include_policy <- match.arg(include_cams_policy, c("auto", "manual"))
+# Keep the original manual vector (NULL or logical vector)
+include_cams_manual <- include_cams_manual
+
+na_policy <- match.arg(dcov_na_policy, c("fill_zero", "mask", "error"))
+
+# covariate mask (optional)
+cov_threshold <- cov_mask_threshold
+use_cov_mask <- !is.null(cov_threshold)
+```
+
+
+# Load Data
+
+We load the project `.RData` that is expected to contain (names may differ by version):
+- `Traps_list`: hair snare locations per session
+- `cam_list`: camera locations per session (may be missing in some sessions)
+- `Y.s`: DNA SCR detection arrays per session (`n_indiv` x `n_traps` x `n_occasions`)
+- `Y.o`: camera detection matrices per session (`n_cameras` x `n_occasions`), possibly with `NA` for non-operational days
+- `O.s`: SCR operation (trap-days) per session (matrix)
+- `xlim.list`, `ylim.list`: original bounding boxes (in **km**)
+
+```{r load-data}
+#stopifnot(file.exists(in_rdata))
+#load(in_rdata)
+
+# Basic sanity checks
+obj_needed <- c("Traps_list", "Y.s", "O.s", "xlim.list", "ylim.list")
+missing <- obj_needed[!vapply(obj_needed, exists, logical(1))]
+if (length(missing)) stop("Missing required objects in input RData: ", paste(missing, collapse = ", "))
+
+# N.session derived from original bounding boxes (in km)
+N.session <- length(xlim.list)
+cat("N.session:", N.session, "\n")
+
+# Construct X1 (hair snares) in meters (project uses km in inputs)
+X1 <- lapply(seq_len(N.session), function(g) Traps_list[[g]] * 1000)
+
+# Construct/validate X2 (cameras) in meters, robust to missing sessions
+if (!exists("X2")) {
+  if (exists("cam_list")) {
+    # Session 1 often lacks cameras; represent as NULL
+    X2 <- vector("list", N.session)
+    for (g in seq_len(N.session)) {
+      if (!is.null(cam_list[[g]])) X2[[g]] <- cam_list[[g]] * 1000 else X2[[g]] <- NULL
+    }
+  } else {
+    X2 <- vector("list", N.session)  # all NULL; will be handled downstream
+  }
+}
+
+X2 <- lapply(X2, function(m) {
+  if (is.null(m)) return(NULL)
+  m <- as.matrix(m)
+  if (nrow(m) == 0) return(NULL)  # treat empty camera sessions as no cameras
+  if (ncol(m) != 2) {
+    stop("X2[[g]] must be a two-column matrix of coordinates (meters).")
+  }
+  m
+})
+
+# Validate shapes
+stopifnot(length(X1) == N.session, length(X2) == N.session)
+```
+
+
+## Session-aware helpers for `Y.o` (place **after** load-data)
+
+```{r yo-helpers}
+# Map session index g -> correct Y.o element (handles Y.o starting at session 2 when X2[[1]] is NULL)
+get_Yo_for_session <- function(g, Y.o, N.session) {
+  if (is.null(Y.o) || length(Y.o) == 0) return(NULL)
+  if (length(Y.o) == N.session) return(Y.o[[g]])
+  if (length(Y.o) == (N.session - 1) && is.null(X2[[1]])) {
+    if (g == 1) return(NULL)
+    return(Y.o[[g - 1]])
+  }
+  if (g <= length(Y.o)) return(Y.o[[g]]) else return(NULL)
+}
+
+# Coerce a per-session Y.o object into a matrix, even if nested (Y/y/detections/etc.)
+coerce_Yo_matrix <- function(yo_g) {
+  if (is.null(yo_g)) return(NULL)
+  if (is.list(yo_g)) {
+    for (nm in c("Y", "y", "Y.o", "detections", "det", "mat")) {
+      if (!is.null(yo_g[[nm]]) && !is.null(dim(yo_g[[nm]]))) {
+        yo_g <- yo_g[[nm]]
+        break
+      }
+    }
+  }
+  if (!is.matrix(yo_g) && !is.data.frame(yo_g)) {
+    yo_g <- tryCatch(as.matrix(yo_g), error = function(e) NULL)
+  }
+  yo_g
+}
+
+# Convenience: get the *matrix* for session g or NULL if absent.
+get_Yo_matrix <- function(g, Y.o, N.session) {
+  coerce_Yo_matrix(get_Yo_for_session(g, Y.o, N.session))
+}
+```
+
+# Load Density Covariates (Lakes, Smoothed Covariate)
+
+We use a **smoothed 1 km raster** for the density covariate and a **lakes** raster to exclude water cells from state-space.
+
+```{r covariates}
+#path_root <- "C:/LocalR/SCR_Dcov_IntegratedRamsey" 
+#root <- path_root
+#smoothed_1km_path <- "CA_forest_age_2022_AOI_buffered_1km.tif" 
+fp_1km <- file.path(path_root, smoothed_1km_path)
+D.cov2 <- raster::raster(fp_lakes)        # lakes 120m grid
+D.cov.use <- raster::raster(fp_1km)
+
+#FOR FOREST AGE ONLY #
+ # pick the raster you want to change
+#D.cov.use[D.cov.use >= 200] <- 0           # replace all 255 values with 0 # might need to resmooth the variable to keep discrete age values
+
+
+plot(D.cov.use, main = "Smoothed covariate (1 km)")
+```
+
+
+# Inspect Operation Files & Trim Unused Occasions
+
+Script B trims **occasion 5** from all sessions **except session 2** (where it exists). This keeps `O.s[[g]]` consistent with the realized effort per session.
+
+```{r trim-operation}
+# Diagnostics
+invisible(lapply(seq_len(min(N.session, 5)), function(g) { print(colSums(O.s[[g]])) }))
+
+# Apply the trimming as per Script B
+if (N.session >= 1) O.s[[1]] <- O.s[[1]][, 1:4]
+if (N.session >= 3) O.s[[3]] <- O.s[[3]][, 1:4]
+if (N.session >= 4) O.s[[4]] <- O.s[[4]][, 1:4]
+if (N.session >= 5) O.s[[5]] <- O.s[[5]][, 1:4]
+if (N.session >= 6) O.s[[6]] <- O.s[[6]][, 1:4]
+```
+
+
+# Quick Overview Plots
+
+We draw traps and (if present) cameras on top of the covariate raster, first at full extent, then zoomed.
+
+```{r overview-plots}
+plot(D.cov.use, main = "All Sessions: Traps (red x) & Cameras (blue o)")
+for (g in seq_len(N.session)) {
+  points(X1[[g]], col = "darkred", pch = 4)
+  if (!is.null(X2[[g]])) points(X2[[g]], col = "blue", pch = 1)
+}
+
+plot(D.cov.use, xlim = zoom[1:2], ylim = zoom[3:4], main = "Zoomed Overview")
+for (g in seq_len(N.session)) {
+  points(X1[[g]], col = "darkred", pch = 4)
+  if (!is.null(X2[[g]])) points(X2[[g]], col = "blue", pch = 1)
+}
+```
+
+
+# Original State-space Boundaries (if available)
+
+If `xlim.list`/`ylim.list` exist (in km), we can overlay the **original** rectangles (converted to meters). Some datasets may not include pre-defined `xlims`/`ylims`. We draw them only if available.
+
+```{r orig-bounds}
+## ---- orig-bounds (unit-safe + session-aware cameras) ----
+# Build xlims/ylims (meters) if objects exist
+if (exists("xlim.list") && exists("ylim.list")) {
+
+  # Helper: scale to meters only if it looks like km (heuristic threshold)
+  to_meters_if_km <- function(v) {
+    if (is.null(v) || any(!is.finite(v))) return(v)
+    if (max(abs(v)) < 1e5) v * 1000 else v
+  }
+
+  xlims <- lapply(seq_len(N.session), function(g) to_meters_if_km(xlim.list[[g]]))
+  ylims <- lapply(seq_len(N.session), function(g) to_meters_if_km(ylim.list[[g]]))
+
+  plot(D.cov.use,
+       xlim = zoom[1:2], ylim = zoom[3:4],
+       main = "Detections & Original State-space (if available)")
+
+  for (g in seq_len(N.session)) {
+    ## Base points
+    points(X1[[g]], col = "black", pch = 4)
+    if (!is.null(X2[[g]])) points(X2[[g]], col = "black", pch = 1)
+
+    ## Highlight DNA trap locations with any detections (robust to length mismatch)
+    trapcap_scr <- tryCatch(1 * (apply(Y.s[[g]], 2, sum) > 0),
+                            error = function(e) integer(0))
+    if (length(trapcap_scr) > 0 && is.matrix(X1[[g]]) && nrow(X1[[g]]) > 0) {
+      if (length(trapcap_scr) == nrow(X1[[g]])) {
+        points(X1[[g]][trapcap_scr == 1, , drop = FALSE], col = "darkred", pch = 4, lwd = 2)
+      } else {
+        # Fallback: only subset indices that exist in X1 rows
+        idx <- which(trapcap_scr == 1)
+        idx <- idx[idx <= nrow(X1[[g]])]
+        if (length(idx)) {
+          points(X1[[g]][idx, , drop = FALSE], col = "darkred", pch = 4, lwd = 2)
+          warning(sprintf("Session %d: Y.s columns (%d) != X1 rows (%d). Highlighted subset only.",
+                          g, length(trapcap_scr), nrow(X1[[g]])))
+        } else {
+          warning(sprintf("Session %d: mismatch Y.s vs X1; no highlighted DNA points drawn.", g))
+        }
+      }
+    }
+
+    ## Highlight camera sites with any detections (session-aware Y.o + robust to mismatch)
+    yo_g <- get_Yo_matrix(g, Y.o, N.session)
+    if (!is.null(X2[[g]]) && !is.null(yo_g)) {
+      trapcap_cam <- tryCatch(1 * (rowSums(yo_g, na.rm = TRUE) > 0),
+                              error = function(e) integer(0))
+      if (length(trapcap_cam) > 0 && is.matrix(X2[[g]]) && nrow(X2[[g]]) > 0) {
+        if (length(trapcap_cam) == nrow(X2[[g]])) {
+          points(X2[[g]][trapcap_cam == 1, , drop = FALSE], col = "darkred", pch = 1, lwd = 2)
+        } else {
+          idx2 <- which(trapcap_cam == 1)
+          idx2 <- idx2[idx2 <= nrow(X2[[g]])]
+          if (length(idx2)) {
+            points(X2[[g]][idx2, , drop = FALSE], col = "darkred", pch = 1, lwd = 2)
+            warning(sprintf("Session %d: Y.o rows (%d) != X2 rows (%d). Highlighted subset only.",
+                            g, length(trapcap_cam), nrow(X2[[g]])))
+          } else {
+            warning(sprintf("Session %d: mismatch Y.o vs X2; no highlighted camera points drawn.", g))
+          }
+        }
+      }
+    }
+
+    ## Draw original boundary if defined
+    if (!is.null(xlims[[g]]) && !is.null(ylims[[g]]) &&
+        all(is.finite(xlims[[g]])) && all(is.finite(ylims[[g]]))) {
+      polygon(rep(xlims[[g]], each = 2),
+              c(ylims[[g]], rev(ylims[[g]])),
+              border = "blue", lwd = 2)
+    }
+  } # end for g
+
+} else {
+  message("xlim.list/ylim.list not available; skipping original boundary overlay.")
+}
+```
+
+
+# Buffered State-space per Session
+
+We compute a **buffered** rectangle around all traps and cameras in each session.
+
+> **Camera-missing logic**: If a session lacks cameras, we buffer around **traps only** for that session.
+
+```{r buffered-bounds}
+# Safe rbind to handle NULL argument (for sessions without cameras)
+rbind_safe <- function(a, b) {
+  if (is.null(a) && is.null(b)) return(matrix(numeric(0), ncol = 2))
+  if (is.null(a)) return(b)
+  if (is.null(b)) return(a)
+  rbind(a, b)
+}
+
+X.all <- vector("list", N.session)
+xlims2 <- ylims2 <- vector("list", N.session)
+
+for (g in seq_len(N.session)) {
+  X.all[[g]] <- rbind_safe(X1[[g]], X2[[g]])
+  xr <- range(X.all[[g]][, 1]) + c(-buffer_m, buffer_m)
+  yr <- range(X.all[[g]][, 2]) + c(-buffer_m, buffer_m)
+  xlims2[[g]] <- xr
+  ylims2[[g]] <- yr
+}
+
+plot(D.cov.use, xlim = c(zoom[1], zoom[2]), ylim = c(zoom[3], zoom[4]), main = "Buffered State-space per Session")
+for (g in seq_len(N.session)) {
+  points(X1[[g]], col = "grey70", pch = 4)
+  if (!is.null(X2[[g]])) points(X2[[g]], col = "grey70", pch = 1)
+  polygon(rep(xlims2[[g]], each = 2), c(ylims2[[g]], rev(ylims2[[g]])), border = "blue", lwd = 2)
+}
+```
+
+
+# Build Regular Grids per Session
+
+We create regular grids (cell centroids) within the buffered rectangles at resolution `grid_res_m`.
+
+```{r grids}
+res <- rep(grid_res_m, N.session)
+cellArea <- res^2
+x.vals <- y.vals <- dSS <- cells <- vector("list", N.session)
+n.cells <- n.cells.x <- n.cells.y <- rep(NA_integer_, N.session)
+
+for (g in seq_len(N.session)) {
+  x.vals[[g]] <- seq(xlims2[[g]][1] + res[g]/2, xlims2[[g]][2] - res[g]/2, res[g])
+  y.vals[[g]] <- seq(ylims2[[g]][1] + res[g]/2, ylims2[[g]][2] - res[g]/2, res[g])
+
+  # Make inclusive final cell
+  xlims2[[g]][2] <- max(x.vals[[g]]) + res[g]/2
+  ylims2[[g]][2] <- max(y.vals[[g]]) + res[g]/2
+
+  dSS[[g]] <- as.matrix(expand.grid(x.vals[[g]], y.vals[[g]]))
+  cells[[g]] <- matrix(1:nrow(dSS[[g]]), nrow = length(x.vals[[g]]), ncol = length(y.vals[[g]]))
+  n.cells[g] <- nrow(dSS[[g]])
+  n.cells.x[g] <- length(x.vals[[g]])
+  n.cells.y[g] <- length(y.vals[[g]])
+}
+
+# Distance helper (vectorized)
+e2dist <- function(x, y) {
+  i <- sort(rep(seq_len(nrow(y)), nrow(x)))
+  dvec <- sqrt((x[, 1] - y[i, 1])^2 + (x[, 2] - y[i, 2])^2)
+  matrix(dvec, nrow = nrow(x), ncol = nrow(y), byrow = FALSE)
+}
+```
+
+
+# In-State-space Mask (InSS)
+
+We mark grid cells within `buffer_m` of **any** trap/camera as **InSS = 1**; others as **0**. Then we remove **lakes** (set those cells to 0). Optionally, we remove high-covariate cells based on `cov_mask_threshold`.
+
+```{r inss}
+InSS <- vector("list", N.session)
+plots_cov <- new_plots <- sampling_plots <- vector("list", N.session)
+
+for (g in seq_len(N.session)) {
+  # 1) buffer-based inclusion
+  dists <- e2dist(dSS[[g]], X.all[[g]])
+  InSS[[g]] <- 1 * (apply(dists, 1, min) < buffer_m)
+
+  # Plot initial mask
+  plot(D.cov.use, xlim = xlims2[[g]], ylim = ylims2[[g]], main = sprintf("Sampling Frame (g=%d)", g))
+  points(X1[[g]], col = "darkred", pch = 4, lwd = 2)
+  if (!is.null(X2[[g]])) points(X2[[g]], col = "blue", pch = 1, lwd = 2)
+  points(dSS[[g]][InSS[[g]] == 0, , drop = FALSE], col = "black", pch = 15)
+  sampling_plots[[g]] <- recordPlot()
+
+  # 2) remove lakes
+  lakes_chr <- as.character(raster::extract(D.cov2, dSS[[g]]))  # non-NA means lake here
+  InSS[[g]] <- as.numeric(ifelse(!is.na(lakes_chr), "0", as.character(InSS[[g]])))
+
+  # Plot after lake removal
+  points(dSS[[g]][InSS[[g]] == 0, , drop = FALSE], col = "black", pch = 15)
+  new_plots[[g]] <- recordPlot()
+
+  # 3) optional: covariate-based removal
+  if (use_cov_mask) {
+    cov_vals <- raster::extract(D.cov1.smoothed.1km, dSS[[g]])
+    bad_cov <- if (isTRUE(treat_cov_na_as_bad)) {
+      is.na(cov_vals) | (cov_vals > cov_threshold)
+    } else {
+      !is.na(cov_vals) & (cov_vals > cov_threshold)
+    }
+    InSS[[g]][bad_cov] <- 0
+  }
+
+  # Plot final mask version
+  points(dSS[[g]][InSS[[g]] == 0, , drop = FALSE], col = "black", pch = 15)
+  plots_cov[[g]] <- recordPlot()
+}
+```
+
+
+# Save State-space Diagnostics (PDF)
+
+```{r pdf-sspace, eval=make_pdfs}
+# Helper to convert recorded plots to grobs
+to_grob <- function(rec_plot) {
+  if (is.null(rec_plot)) return(NULL)
+  ggplotify::as.grob(function() replayPlot(rec_plot))
+}
+
+n_pages <- N.session
+pdf(out_pdf_sspace, width = 12, height = 4)
+for (i in seq_len(n_pages)) {
+  g_sampling <- to_grob(sampling_plots[[i]])
+  g_full     <- to_grob(new_plots[[i]])
+  g_cov     <- to_grob(plots_cov[[i]])
+
+  if (is.null(g_sampling)) g_sampling <- ggplotify::as.grob(function() { plot.new(); box(); title("Missing sampling_plot") })
+  if (is.null(g_cov))     g_cov     <- ggplotify::as.grob(function() { plot.new(); box(); title("Missing plots_cov") })
+  if (is.null(g_full))     g_full     <- ggplotify::as.grob(function() { plot.new(); box(); title("Missing new_plots") })
+
+  page_plot <- cowplot::plot_grid(g_sampling, g_full, g_cov, ncol = 3, labels = c("A", "B", "C"), label_size = 14)
+  page_with_title <- cowplot::ggdraw() +
+    cowplot::draw_label(sprintf("State space %d", i), x = 0.5, y = 0.98, hjust = 0.5, vjust = 1, fontface = "bold", size = 16) +
+    cowplot::draw_plot(page_plot, x = 0, y = 0, width = 1, height = 0.95)
+  print(page_with_title)
+}
+dev.off()
+cat("Wrote:", out_pdf_sspace, "\n")
+```
+
+
+# Spatial Recaptures & Camera Detections (Diagnostics)
+
+We visualize spatial recaptures (connected to the crude centroid of captures) and camera detections (white filled circles). **White dots = cameras with any detections in Y.o** (not individual recaptures).
+
+```{r recaps}
+# ---- Spatial Recaptures & Camera Detections (Diagnostics) ----
+detection_plots <- vector("list", N.session)
+
+for (g in seq_len(N.session)) {
+  # Base plot with correct (meter) limits
+  plot(D.cov.use, xlim = xlims2[[g]], ylim = ylims2[[g]],
+       main = sprintf("Recapture Diagnostics (g=%d)", g))
+
+  # 1) Draw black-out cells FIRST so points/lines are visible on top
+  if (!is.null(InSS[[g]]) && length(InSS[[g]]) == nrow(dSS[[g]])) {
+    points(dSS[[g]][InSS[[g]] == 0, , drop = FALSE], pch = 15, col = "black")
+  }
+
+  # 2) Traps (hair snares)
+  if (!is.null(X1[[g]]) && is.matrix(X1[[g]]) && nrow(X1[[g]]) > 0) {
+    points(X1[[g]], col = "darkred", pch = 4, lwd = 2)
+  }
+
+  # 3) Camera sites (outline, all)
+  if (!is.null(X2[[g]]) && is.matrix(X2[[g]]) && nrow(X2[[g]]) > 0) {
+    points(X2[[g]], col = "purple", pch = 1, lwd = 2)
+  }
+
+  # 4) DNA SCR recaptures
+  if (!is.null(Y.s[[g]]) && length(dim(Y.s[[g]])) == 3) {
+    y2D <- apply(Y.s[[g]], c(1, 2), sum)  # individuals x traps
+    if (is.matrix(y2D) && nrow(y2D) > 0 && ncol(y2D) == nrow(X1[[g]])) {
+      for (i in seq_len(nrow(y2D))) {
+        trapcap <- which(y2D[i, ] > 0)
+        if (length(trapcap) > 1) {
+          s <- colMeans(X1[[g]][trapcap, , drop = FALSE])
+          points(s[1], s[2], pch = 16, col = "red", cex = 2)
+          for (j in seq_along(trapcap)) {
+            lines(c(s[1], X1[[g]][trapcap[j], 1]),
+                  c(s[2], X1[[g]][trapcap[j], 2]),
+                  col = "blue", lwd = 2)
+          }
+        } else if (length(trapcap) == 1) {
+          points(X1[[g]][trapcap, 1], X1[[g]][trapcap, 2],
+                 pch = 16, col = "darkorange", cex = 2)
+        }
+      }
+    } else if (is.matrix(y2D) && nrow(y2D) > 0) {
+      warning(sprintf("Session %d: ncol(Y.s)=%d does not match nrow(X1)=%d; SCR recapture plotting may be misaligned.",
+                      g, ncol(y2D), if (!is.null(X1[[g]])) nrow(X1[[g]]) else -1))
+    }
+  }
+
+  # 5) Camera detections (session-aware Y.o, nested-aware, clipping, NA filtering)
+  yo_g <- get_Yo_matrix(g, Y.o, N.session)
+
+  if (!is.null(X2[[g]]) &&
+      is.matrix(X2[[g]]) && nrow(X2[[g]]) > 0 &&
+      !is.null(yo_g)) {
+
+    trapcap2 <- tryCatch(
+      which(rowSums(yo_g, na.rm = TRUE) > 0),
+      error = function(e) integer(0)
+    )
+
+    if (length(trapcap2)) {
+      # Clip to valid X2 row indices
+      trapcap2 <- trapcap2[trapcap2 >= 1 & trapcap2 <= nrow(X2[[g]])]
+
+      # Filter rows with NA coordinates
+      ok_rows <- stats::complete.cases(X2[[g]])
+      trapcap2 <- trapcap2[ok_rows[trapcap2]]
+
+      if (length(trapcap2)) {
+        points(X2[[g]][trapcap2, , drop = FALSE],
+               pch = 21, bg = "white", col = "black", cex = 1.8, lwd = 0.8)
+      } else {
+        warning(sprintf(
+          "Session %d: detected cameras in Y.o but none plottable after bounds/NA filtering. (Y.o rows=%d, X2 rows=%d)",
+          g, NROW(yo_g), nrow(X2[[g]])
+        ))
+      }
+    }
+  }
+
+  detection_plots[[g]] <- recordPlot()
+}
+```
+
+```{r pdf-recaps, eval=make_pdfs}
+pdf(out_pdf_recaps, width = 8, height = 6)
+for (p in detection_plots) print(p)
+dev.off()
+cat("Wrote:", out_pdf_recaps, "\n")
+```
+
+
+# Extract Density Covariate per Cell & Handle NA Policy
+
+We extract `D.cov.use` at each grid centroid. NA handling follows `dcov_na_policy`:
+- **fill_zero**: replace NA with 0,
+- **mask**: leave NA (ensure these cells are **excluded** by `InSS`),
+- **error**: stop if any NA present.
+
+```{r dcov-extract}
+D.cov.store <- vector("list", N.session)
+for (g in seq_len(N.session)) {
+  D.cov.store[[g]] <- raster::extract(x = D.cov.use, y = dSS[[g]], fun = mean)
+}
+
+na_counts <- vapply(D.cov.store, function(x) sum(is.na(x)), integer(1))
+print(na_counts)
+
+if (na_policy == "fill_zero") {
+  for (g in seq_len(N.session)) D.cov.store[[g]][is.na(D.cov.store[[g]])] <- 0
+} else if (na_policy == "mask") {
+  # leave as NA; ensure such cells are InSS=0
+  for (g in seq_len(N.session)) InSS[[g]][is.na(D.cov.store[[g]])] <- 0
+} else if (na_policy == "error") {
+  if (any(na_counts > 0)) stop("NA present in D.cov.store with na_policy='error'")
+}
+```
+
+
+# Shift Coordinates: Lower-left to (0,0)
+
+We shift all coordinates per session so that the lower-left corner of each buffered state-space is at (0,0). This is important for efficient cell lookup in Nimble.
+
+```{r shift}
+xlim <- ylim <- matrix(NA_real_, N.session, 2)
+for (g in seq_len(N.session)) {
+  xlim[g, ] <- xlims2[[g]]
+  ylim[g, ] <- ylims2[[g]]
+}
+
+for (g in seq_len(N.session)) {
+  x.shift <- xlim[g, 1]
+  y.shift <- ylim[g, 1]
+
+  xlim[g, ] <- xlim[g, ] - x.shift
+  ylim[g, ] <- ylim[g, ] - y.shift
+  x.vals[[g]] <- x.vals[[g]] - x.shift
+  y.vals[[g]] <- y.vals[[g]] - y.shift
+  X1[[g]][, 1] <- X1[[g]][, 1] - x.shift
+  X1[[g]][, 2] <- X1[[g]][, 2] - y.shift
+
+  if (!is.null(X2[[g]])) {
+    X2[[g]][, 1] <- X2[[g]][, 1] - x.shift
+    X2[[g]][, 2] <- X2[[g]][, 2] - y.shift
+  }
+
+  dSS[[g]][, 1] <- dSS[[g]][, 1] - x.shift
+  dSS[[g]][, 2] <- dSS[[g]][, 2] - y.shift
+}
+```
+
+
+# Visual Check: Covariate Grids & Exclusions
+
+```{r visual-check}
+for (g in seq_len(N.session)) {
+  image(x.vals[[g]], y.vals[[g]], matrix(D.cov.store[[g]], n.cells.x[[g]], n.cells.y[[g]]),
+        col = hcl.colors(12, "Greens", rev = TRUE),
+        main = sprintf("D.cov (session %d)", g))
+  points(X1[[g]], col = "darkred", pch = 4, lwd = 2)
+  if (!is.null(X2[[g]])) points(X2[[g]], col = "goldenrod", pch = 1, lwd = 2)
+  points(dSS[[g]][InSS[[g]] == 0, , drop = FALSE], pch = 15)
+}
+```
+
+
+# Package Data for Nimble (per Session)
+
+We create a `data[[g]]` list per session. **Camera inclusion** obeys `include_cams_policy`:
+
+- `auto`: include cameras only if both `X2[[g]]` and `Y.o[[g]]` exist and are non-empty.
+- `manual`: use `include_cams_manual` (logical vector of length `N.session`).
+
+```{r package-data}
+# Helpers to determine availability
+has_cam_coords <- function(g) !is.null(X2[[g]]) && is.matrix(X2[[g]]) && nrow(X2[[g]]) > 0 && ncol(X2[[g]]) == 2
+has_y_o <- function(g) {
+  yo <- get_Yo_matrix(g, Y.o, N.session)
+  !is.null(yo) && is.matrix(yo) && all(dim(yo) > 0)
+}
+
+include_cams <- logical(N.session)
+if (include_policy == "manual") {
+  if (is.null(include_cams_manual)) stop("Manual camera policy selected but 'include_cams_manual' is NULL.")
+  if (length(include_cams_manual) != N.session) stop("'include_cams_manual' must be length N.session.")
+  include_cams <- as.logical(include_cams_manual)
+} else {
+  for (g in seq_len(N.session)) include_cams[g] <- has_cam_coords(g) && has_y_o(g)
+}
+
+# Now package
+data <- vector("list", N.session)
+for (g in seq_len(N.session)) {
+  data[[g]]$y1 <- Y.s[[g]]                  # SCR detection data (DNA)
+  data[[g]]$X1 <- X1[[g]] / 1000            # km
+  data[[g]]$K1 <- dim(Y.s[[g]])[3]
+  data[[g]]$K2D1 <- O.s[[g]]                # SCR operation file
+  data[[g]]$xlim <- xlim[g, ] / 1000
+  data[[g]]$ylim <- ylim[g, ] / 1000
+  data[[g]]$x.vals <- x.vals[[g]] / 1000
+  data[[g]]$y.vals <- y.vals[[g]] / 1000
+  data[[g]]$dSS <- dSS[[g]] / 1000
+  data[[g]]$cells <- cells[[g]]
+  data[[g]]$n.cells <- n.cells[g]
+  data[[g]]$n.cells.x <- n.cells.x[g]
+  data[[g]]$n.cells.y <- n.cells.y[g]
+  data[[g]]$D.cov <- D.cov.store[[g]]
+  data[[g]]$InSS <- InSS[[g]]
+  data[[g]]$res <- res[g] / 1000
+  data[[g]]$cellArea <- data[[g]]$res^2
+  data[[g]]$n1 <- nrow(Y.s[[g]])
+
+  if (isTRUE(include_cams[g])) {
+    yo_raw <- get_Yo_matrix(g, Y.o, N.session)
+    if (is.null(yo_raw)) {
+      data[[g]]$y2   <- NA
+      data[[g]]$X2   <- NA
+      data[[g]]$K2   <- NA
+      data[[g]]$K1D2 <- NA
+    } else {
+      K1D2 <- rowSums(!is.na(yo_raw))       # camera operation as number of observed days
+      yo_g <- yo_raw
+      yo_g[is.na(yo_g)] <- 0                # non-operational -> 0 detections
+      data[[g]]$y2   <- yo_g
+      data[[g]]$X2   <- X2[[g]] / 1000
+      data[[g]]$K2   <- ncol(yo_g)
+      data[[g]]$K1D2 <- K1D2
+    }
+  } else {
+    data[[g]]$y2   <- NA
+    data[[g]]$X2   <- NA
+    data[[g]]$K2   <- NA
+    data[[g]]$K1D2 <- NA
+  }
+}
+
+# Save bundle
+save(data, file = out_rdata)
+cat("Wrote:", out_rdata, "\n")
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
