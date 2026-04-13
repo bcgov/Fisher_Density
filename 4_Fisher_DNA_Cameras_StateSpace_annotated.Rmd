@@ -48,8 +48,8 @@ occasion_length     <- 14            # days for detectionHistory
 tz_local            <- "America/Vancouver"
 preserve_zero_projects <- TRUE
 
-root       <- "I:/Ecosystems/Conservation Science/Species/Mesocarnivores/Projects/MMP/2.Data"
-local_root <- "C:/LocalR"
+root       <- "//Sfp.idir.bcgov/s140/S40203/Ecosystems/Conservation Science/Species/Mesocarnivores/Projects/MMP/2.Data"
+local_root <- "/2. GIS"
 
 paths <- list(
   shp_meso_grid      = file.path(local_root, "BC_meso_grid.shp"),
@@ -62,8 +62,8 @@ paths <- list(
   det_all            = file.path(root, "1. MDB-Collation/5. Master data cleaned/Species specific/Fisher/fisher_detections_singledeployment_2026-02-24.csv"),
   det_winter         = file.path(root, "1. MDB-Collation/5. Master data cleaned/Species specific/Fisher/fisher_detections_singledeployment_winter2026-03-02.csv"),
   out_dir            = local_root,
-  save_rdata_winter  = file.path(local_root, "SCR_Dcov_IntegratedRamsey/Process_Fisher_camera-DNA_winter-only_Feb.RData"),
-  save_rdata_all     = file.path(local_root, "SCR_Dcov_IntegratedRamsey/Process_Fisher_camera-DNA_allseasons_March.RData")
+  save_rdata_winter  = file.path(local_root, "Process_Fisher_camera-DNA_winter-only_Feb.RData"),
+  save_rdata_all     = file.path(local_root, "Process_Fisher_camera-DNA_allseasons_March.RData")
 )
 ```
 
@@ -100,7 +100,8 @@ assign_states <- function(df, state_map_tbl) {
 - Read **subpopulations** for context plotting.
 
 ```{r aoi}
-grid_columbian <- sf::st_read(paths$shp_columbian_grid, quiet = TRUE) |>
+
+grid_columbian <- sf::st_read(paste0(".",paths$shp_columbian_grid), quiet = TRUE) |>
   sf::st_transform(crs_albers)
 
 columbian_area <- grid_columbian |>
@@ -1147,15 +1148,15 @@ ggsave("DNA_Cameras_with_6_zoom_panes_matched_colors.png",
 
 ## Save workspace
 ```{r save}
-if (!dir.exists(dirname(paths$save_rdata_winter))) dir.create(dirname(paths$save_rdata_winter), recursive = TRUE, showWarnings = FALSE)
-if (!dir.exists(dirname(paths$save_rdata_all))) dir.create(dirname(paths$save_rdata_all), recursive = TRUE, showWarnings = FALSE)
+if (!dir.exists(dirname(paste0(".",paths$save_rdata_winter)))) dir.create(dirname(paste0(".",paths$save_rdata_winter)), recursive = TRUE, showWarnings = FALSE)
+if (!dir.exists(dirname(paste0(".",paths$save_rdata_all)))) dir.create(dirname(paste0(".",paths$save_rdata_all)), recursive = TRUE, showWarnings = FALSE)
 
 if (identical(season, "winter")) {
-  save.image(file = paths$save_rdata_winter)
-  cat("Saved:", paths$save_rdata_winter, "\n")
+  save.image(file = paste0(".",paths$save_rdata_winter))
+  cat("Saved:", paste0(".",paths$save_rdata_winter), "\n")
 } else {
-  save.image(file = paths$save_rdata_all)
-  cat("Saved:", paths$save_rdata_all, "\n")
+  save.image(file = paste0(".",paths$save_rdata_all))
+  cat("Saved:", paste0(".",paths$save_rdata_all, "\n"))
 }
 ```
 
