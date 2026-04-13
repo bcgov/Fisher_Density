@@ -1,0 +1,415 @@
+---
+title: "6 Fit Integrated Density Model (SCR + Cameras): Fully Annotated Workflow"
+author: "Prepared for new analysts"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+# Overview & Purpose
+
+This script reads the **prepared data** saved in **Script 5** and runs an **integrated density model** (DNA SCR + cameras) in **nimble**. The workflow is fully annotated for new analysts.
+
+**Key behaviors in this script**
+
+- **Minimal, data‑driven session reordering**: immediately after loading `data`, we reorder sessions so **camera sessions are first**, and **non‑camera sessions are last**.
+- **Manual loop edit reminder**: the script prints how many sessions have/ don’t have cameras and shows exactly how to edit any loops in your **model files** or **sampler blocks** that are currently coded as `1:(N.session-1)`.
+- **Choose model type** (both are linear):
+  - `fixed` — fixed slopes/intercepts across sessions
+  - `random` — random slopes/intercepts across sessions
+  The script **sources a different Nimble model file** based on `model_type`.
+
+> ⚠️ **Important**: We are *not* modifying your Nimble model code here. If your model file still has hard-coded loops (e.g., `for(g in 1:(N.session-1))`), use the **console message** this script prints to update them to the correct ranges based on the actual data.
+
+---
+
+# Parameters
+
+```{r parameters}
+# Root path for code and data
+path_root <- "C:/LocalR/"
+
+# Prepared data bundle from Script 5
+#input_data_rdata <- file.path(path_root, "Fit_data_elev_Fisher_Jan_pl.RData")
+
+# Model type: choose which Nimble model file to source
+#   "fixed"  -> fixed slopes/intercepts across sessions
+#   "random" -> random slopes/intercepts across sessions
+model_type <- "random"   # "fixed" or "random"
+
+# Filenames for model and helpers (adjust names if your repo differs)
+fp <- function(x) file.path(path_root, x)
+
+sim_single_file        <- fp("sim.SCR.Dcov.Mb.Ramsey.R")                   # single-session simulator (helper)
+sim_multi_file         <- fp("sim.SCR.Dcov.Multi.Mb.Ramsey.R")             # multisession wrapper (helper)
+init_multi_file        <- fp("init.SCR.Dcov.Multi.Mb.Ramsey.R")             # prepares multi-session arrays
+nimble_functions_file  <- fp("NimbleFunctions SCR Dcov Multisession Mb Ramsey All Sessions.R")
+sampler_functions_file <- fp("sSampler Dcov Multisession Mb Ramsey All Sessions.R")
+mask_check_file        <- fp("mask.check.R")
+
+nimble_model_file <- switch(model_type,
+  fixed  = fp("NimbleModel SCR Dcov Multisession Mb Ramsey Marginal All Sessions_fixed.R"),
+  random = fp("NimbleModel SCR Dcov Multisession Mb Ramsey Marginal All Sessions.R"),
+  stop("model_type must be 'fixed' or 'random'"))
+
+# Data augmentation per session (length N.session). Adjust as needed
+M_default <- c(125, 250, 350, 400, 550, 250)
+
+# MCMC settings
+n_iter   <- 60000
+nburnin  <- 20000
+n_chains <- 1
+thin_par <- 1
+thin_aux <- 25
+
+# Output
+
+run_date <- format(Sys.Date(), "%Y-%m-%d")
+out_summary_csv <- sprintf("mcmc_summary_%s_%s_%s.csv",
+                           model_type, n_iter, run_date)
+out_trace_pdf   <- sprintf("mcmc_trace_%s_%s_%s.pdf",
+                           model_type, n_iter, run_date)
+
+```
+
+# Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 9, fig.height = 6)
+
+# Packages
+suppressPackageStartupMessages({
+  library(nimble)
+  library(coda)
+  library(RColorBrewer)
+  library(MCMCvis)
+})
+
+# Nimble options (version-dependent)
+nimbleOptions(determinePredictiveNodesInModel = FALSE)
+# For nimble < 0.13.1, you might need instead:
+# nimble:::setNimbleOption('MCMCjointlySamplePredictiveBranches', FALSE)
+```
+
+# Source model and helpers
+
+```{r source-files}
+source(sim_single_file)
+source(sim_multi_file)
+source(init_multi_file)
+source(nimble_model_file)      # defines NimModel (fixed or random)
+source(nimble_functions_file)
+source(sampler_functions_file)
+source(mask_check_file)
+```
+
+# Load data and **minimally** reorder sessions (camera-first)
+
+```{r load-and-reorder}
+# Read the Script-5 output (named 'data')
+#load(input_data_rdata)
+stopifnot(exists("data"))
+N.session <- length(data)
+cat("N.session (before reorder):", N.session, "\n")
+
+# Minimal reorder: put camera sessions first, no-camera sessions last
+has_cams_vec <- vapply(seq_len(N.session), function(g) {
+  x2_ok <- !is.null(data[[g]]$X2) && is.matrix(data[[g]]$X2) && nrow(data[[g]]$X2) > 0
+  y2_ok <- !is.null(data[[g]]$y2) && is.matrix(data[[g]]$y2) && all(dim(data[[g]]$y2) > 0)
+  x2_ok && y2_ok
+}, logical(1))
+
+sessions_with_cams    <- which(has_cams_vec)
+sessions_without_cams <- which(!has_cams_vec)
+
+new_order <- c(sessions_with_cams, sessions_without_cams)
+data <- data[new_order]
+
+N_cam    <- length(sessions_with_cams)
+N_no_cam <- length(sessions_without_cams)
+
+cat("\n[Reorder] New session order (camera-first): ", paste(new_order, collapse = ", "),
+    "\n[Reorder] N_cam = ", N_cam, " | N_no_cam = ", N_no_cam,
+    "\n[Reorder] Manual edit needed in model/samplers:",
+    "\n          • Change camera loops from  for(g in 1:(N.session-1))  to  for(g in 1:", N_cam, ")",
+    if (N_no_cam > 0)
+      paste0("\n          • No-camera loops should target the last ", N_no_cam,
+             " session(s): for(g in ", (N.session - N_no_cam + 1), ":", N.session, ")")
+    else "\n          • No-camera loops can be removed (none present).",
+    "\n\n", sep = "")
+```
+
+# Mask sanity check (per session)
+
+```{r mask-check}
+for (g in seq_len(N.session)) {
+  mask.check(dSS = data[[g]]$dSS,
+             cells = data[[g]]$cells,
+             n.cells = data[[g]]$n.cells,
+             n.cells.x = data[[g]]$n.cells.x,
+             n.cells.y = data[[g]]$n.cells.y,
+             res = data[[g]]$res,
+             xlim = data[[g]]$xlim,
+             ylim = data[[g]]$ylim,
+             x.vals = data[[g]]$x.vals,
+             y.vals = data[[g]]$y.vals)
+}
+```
+
+# Standardize the density covariate (pooled across sessions)
+
+```{r standardize-dcov}
+D.cov.all.vals <- unlist(lapply(data, function(x) x$D.cov))
+mean.D.cov <- mean(D.cov.all.vals)
+sd.D.cov   <- sd(D.cov.all.vals)
+for (g in seq_len(N.session)) data[[g]]$D.cov <- (data[[g]]$D.cov - mean.D.cov) / sd.D.cov
+```
+
+# Initialize multisession structures
+
+```{r init-multi}
+# M vector follows the (reordered) sessions
+M <- if (length(M_default) == 1L) rep(M_default, N.session) else M_default
+stopifnot(length(M) == N.session)
+
+nimbuild <- init.SCR.Dcov.Multi.Mb.Ramsey(data, M)
+
+# Quick visual QA: initialized activity centers are in habitat
+par(mfrow = c(2, 3))
+for (g in seq_len(N.session)) {
+  image(data[[g]]$x.vals, data[[g]]$y.vals,
+        matrix(data[[g]]$InSS, data[[g]]$n.cells.x, data[[g]]$n.cells.y),
+        main = sprintf("Init s in InSS (g=%d)", g), col = hcl.colors(12, "Greens", rev = TRUE))
+  points(nimbuild$s.init[g,,], pch = 16, cex = 0.6)
+}
+par(mfrow = c(1, 1))
+```
+
+# Build inits, constants, data
+
+```{r nimble-objects}
+# Inits (must include z.init, N.init, and s.init for DA scheme)
+Niminits <- list(
+  z = nimbuild$z.init,
+  N = rowSums(nimbuild$z.init),
+  s = nimbuild$s.init,
+  beta0.p0.SCR.fixed = -3,
+  beta1.p0.SCR.fixed = 3,
+  p0.USCR = rep(0.1, N.session),
+  sigma.fixed = 4.5,
+  D0 = rowSums(nimbuild$z.init) / (rowSums(nimbuild$InSS) * nimbuild$cellArea),
+  D.beta1 = rep(0, N.session)
+)
+
+# Constants (match Nimble model spec)
+constants <- list(
+  N.session = N.session,
+  M         = M,
+  J1        = nimbuild$J1,
+  J2        = nimbuild$J2,
+  K1        = nimbuild$K1,
+  K2D1      = nimbuild$K2D1,
+  K1D2      = nimbuild$K1D2,
+  xlim      = nimbuild$xlim,
+  ylim      = nimbuild$ylim,
+  D.cov     = nimbuild$D.cov,
+  cellArea  = nimbuild$cellArea,
+  n.cells   = nimbuild$n.cells,
+  res       = nimbuild$res
+)
+
+# Data
+Nimdata <- list(
+  y1        = nimbuild$y1,
+  y1.state  = nimbuild$y1.state,
+  y2        = nimbuild$y2,
+  z         = nimbuild$z.data,
+  X1        = nimbuild$X1,
+  X2        = nimbuild$X2,
+  dummy.data= nimbuild$dummy.data,
+  cells     = nimbuild$cells,
+  InSS      = nimbuild$InSS
+)
+```
+
+# Configure samplers and monitors
+
+```{r mcmc-config}
+# Monitors (both model types are linear; difference is fixed vs random effects in the sourced file)
+parameters  <- c('N','lambda.N','beta0.p0.SCR.fixed','beta1.p0.SCR.fixed','p0.USCR','sigma.fixed','D0','D.beta1')
+parameters2 <- c('lambda.cell','s.cell','D0')   # record D0 for plotting/diagnostics
+nt  <- thin_par
+nt2 <- thin_aux
+
+# Build model (ignore version-dependent warnings; see header notes)
+Rmodel <- nimbleModel(code = NimModel, constants = constants, data = Nimdata, check = FALSE, inits = Niminits)
+config.nodes <- c('beta0.p0.SCR.fixed','beta1.p0.SCR.fixed','p0.USCR','sigma.fixed','D0','D.beta1')
+conf <- configureMCMC(Rmodel, monitors = parameters, thin = nt, monitors2 = parameters2, thin2 = nt2,
+                      nodes = config.nodes, useConjugacy = FALSE)
+
+# Required sampler replacements (camera-aware vs no-camera)
+z_ups <- round(M * 0.25)
+
+# Camera sessions (FIRST N_cam after reorder)
+if (N_cam > 0) {
+  for (g in 1:N_cam) {
+    conf$addSampler(target = paste0("N[", g, "]"), type = 'zSamplerCams',
+                    control = list(g = g, inds.detected = 1:nimbuild$n1[g], z.ups = z_ups[g],
+                                   J1 = nimbuild$J1[g], J2 = nimbuild$J2[g], K1 = nimbuild$K1[g], M = M[g]),
+                    silent = TRUE)
+    for (i in seq_len(M[g])) {
+      conf$addSampler(target = paste0("s[", g, ",", i, ", 1:2]"), type = 'sSamplerCams',
+                      control = list(g = g, i = i, J1 = nimbuild$J1[g], J2 = nimbuild$J2[g], K1 = nimbuild$K1[g],
+                                     res = nimbuild$res[g], n.cells = nimbuild$n.cells[g], n.cells.x = nimbuild$n.cells.x[g],
+                                     n.cells.y = nimbuild$n.cells.y[g], xlim = nimbuild$xlim[g,], ylim = nimbuild$ylim[g,]),
+                      silent = TRUE)
+    }
+  }
+}
+
+# No-camera sessions (LAST N_no_cam after reorder)
+if (N_no_cam > 0) {
+  for (g in (N.session - N_no_cam + 1):N.session) {
+    conf$addSampler(target = paste0("N[", g, "]"), type = 'zSamplerNoCams',
+                    control = list(g = g, inds.detected = 1:nimbuild$n1[g], z.ups = z_ups[g],
+                                   J1 = nimbuild$J1[g], K1 = nimbuild$K1[g], M = M[g]),
+                    silent = TRUE)
+    for (i in seq_len(M[g])) {
+      conf$addSampler(target = paste0("s[", g, ",", i, ", 1:2]"), type = 'sSamplerNoCams',
+                      control = list(g = g, i = i, J1 = nimbuild$J1[g], K1 = nimbuild$K1[g],
+                                     res = nimbuild$res[g], n.cells = nimbuild$n.cells[g], n.cells.x = nimbuild$n.cells.x[g],
+                                     n.cells.y = nimbuild$n.cells.y[g], xlim = nimbuild$xlim[g,], ylim = nimbuild$ylim[g,]),
+                      silent = TRUE)
+    }
+  }
+}
+
+# Often helpful to block these parameters per session
+for (g in seq_len(N.session)) {
+  conf$addSampler(target = c(paste0("D0[", g, "]"), paste0("D.beta1[", g, "]")),
+                  type = 'AF_slice', control = list(adaptive = TRUE), silent = TRUE)
+}
+```
+
+# Compile
+
+```{r run}
+Rmcmc  <- buildMCMC(conf)
+Cmodel <- compileNimble(Rmodel)
+Cmcmc  <- compileNimble(Rmcmc, project = Rmodel)
+
+```
+
+# Run 
+
+Loop to run a chain, save and run next chain. This helps when problems when no enough memory. By setting a seed you can replicate posteriors. 
+
+```{r}
+start.time <- Sys.time()
+for (ch in 1:n_chains) {
+  set.seed(123 + ch)  # different seed per chain for independence
+  # Run ONE chain at a time
+  samp <- runMCMC(Cmcmc,
+                  niter             = n_iter,
+                  nburnin           = nburnin,
+                  nchains           = 1, ## always 1 as n_chains is already set in the loop
+                  samplesAsCodaMCMC = TRUE)  # returns an mcmc.list of length 1
+  # Save as RDS (preserves types cleanly)
+  saveRDS(samp, file = sprintf("mcmc_chain_%02d.rds", ch))
+  # Optionally also save as CSV for quick inspection
+  m <- as.matrix(samp[[1]])
+  write.csv(m, file = sprintf("mcmc_chain_%02d.csv", ch), row.names = TRUE)
+  rm(samp, m); gc()  # keep memory tidy for long runs
+}
+
+end.time <- Sys.time()
+cat("Total wall time:", end.time - start.time, "\n")
+
+```
+
+# Summarize and export
+
+```{r summarize, message=FALSE}
+
+# MCMC settings
+n_iter   <- 60000
+n_chains <- 3
+
+# Output
+model_type <-  "random"
+run_date <- format(Sys.Date(), "%Y-%m-%d")
+out_summary_csv <- sprintf("mcmc_summary_%s_%s_%s.csv",
+                           model_type, n_iter, run_date)
+out_trace_pdf   <- sprintf("mcmc_trace_%s_%s_%s.pdf",
+                           model_type, n_iter, run_date)
+
+
+# 1) Read the saved chains (each file contains an mcmc.list of length 1)
+files <- sprintf("new_winter_mcmc_chain_%02d.rds", 1:n_chains)
+stopifnot(all(file.exists(files)))
+chains_raw <- lapply(files, readRDS)  # each is mcmc.list of length 1
+ 
+# 2) Flatten to a single mcmc.list with one chain per element
+mcmc_list <- do.call(mcmc.list, lapply(chains_raw, `[[`, 1))
+ 
+# ---- If you want to drop parameters BEFORE passing to MCMCvis: ----
+# Convert to matrices -> drop columns -> convert back to mcmc.list
+ 
+# Find which columns to drop using the first chain as template
+mat1 <- as.matrix(mcmc_list[[1]])
+drop <- colnames(mat1) %in% c(paste0("lambda.N[", 1:6, "]"), c("p0.USCR[6]", "p0.USCR[5]"))  #may need to add "p0.USCR[x]" for other sites without cameras
+ 
+# Apply the same filter to all chains (safely handling missing names)
+mcmc_list_filtered <- mcmc.list(lapply(mcmc_list, function(ch) {
+  m <- as.matrix(ch)
+  # align columns to the template names to avoid subtle ordering differences
+  m <- m[, colnames(mat1), drop = FALSE]
+  m <- m[, !drop, drop = FALSE]
+  as.mcmc(m)
+}))
+ 
+# 3) Summaries and trace plots with MCMCvis
+dat <- MCMCsummary(mcmc_list_filtered, round = 2)
+write.csv(dat, out_summary_csv, row.names = TRUE)
+ 
+MCMCtrace(object  = mcmc_list_filtered,
+          pdf     = TRUE,
+          filename= out_trace_pdf,
+          ind     = TRUE,   # different lines per chain
+          Rhat    = TRUE,   # add Rhat
+          n.eff   = TRUE,   # add effective sample size
+          params  = "all")
+
+#If you get an error similar to this:Error in quantile.default(newX[, i], ...) : 
+#  missing values and NaN's not allowed if 'na.rm' is FALSE
+# check the drop object, you might need to include other p0.USCR[6] if you are missing cameras in state spaces
+
+```
+
+# Diagnostics: final activity centers in habitat
+
+```{r final-centers}
+par(mfrow = c(2, 3))
+for (g in seq_len(N.session)) {
+  image(data[[g]]$x.vals, data[[g]]$y.vals,
+        matrix(data[[g]]$InSS, data[[g]]$n.cells.x, data[[g]]$n.cells.y),
+        main = sprintf("Final s in InSS (g=%d)", g), col = hcl.colors(12, "Greens", rev = TRUE))
+  points(Cmodel$s[g,,], pch = 16, cex = 0.6)
+}
+par(mfrow = c(1, 1))
+```
+
+# Notes on warnings & camera logic
+
+- You may see version-dependent warnings at model definition time about dimensions for `p0.USCR`, `y2`, `X2`, `cells`. These typically reflect **mismatches between data order and model loop assumptions**. We **reordered sessions camera-first** to align with models that expect the first *K* sessions to have cameras.
+- This script prints **`N_cam`** and **`N_no_cam`** after loading data so you can **manually edit** any hard-coded camera loop bounds (e.g., change `for(g in 1:(N.session-1))` to `for(g in 1:N_cam)`).
+- Use `model_type <- "fixed"` or `"random"` at the top to choose the Nimble model file to source.
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
