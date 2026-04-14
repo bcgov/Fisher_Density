@@ -17,9 +17,9 @@ If you need to change covariates, there are smoothed variables saved on *I:\Ecos
 If you need to smooth a new raster you can run the script #2 on the folder *I:\Ecosystems\Conservation Science\Species\Mesocarnivores\Projects\MMP\3.Analysis_Conceptual\Comm_occ\1. Scripts*
 
 ```{r parameters}
-# change to project root or use a relative path like "SCR_Dcov_IntegratedRamsey"
-path_root <- "C:/LocalR/SCR_Dcov_IntegratedRamsey/2. GIS"
-out_root <- "C:/LocalR/SCR_Dcov_IntegratedRamsey/3. Outputs"
+# getwd() - make sure the project file is in the correct folder
+path_root <- "./2. GIS"
+out_root <- "./3. Outputs"
 input_rdata <- "Process_Fisher_camera-DNA_allseasons_March.RData" # or "Fisher_camera-DNA_winter-only_Jan_pl.RData"
 in_rdata <- file.path(out_root, input_rdata)
 stopifnot(file.exists(in_rdata))
@@ -213,17 +213,14 @@ get_Yo_matrix <- function(g, Y.o, N.session) {
 We use a **smoothed 1 km raster** for the density covariate and a **lakes** raster to exclude water cells from state-space.
 
 ```{r covariates}
-#path_root <- "C:/LocalR/SCR_Dcov_IntegratedRamsey" 
-#root <- path_root
-#smoothed_1km_path <- "CA_forest_age_2022_AOI_buffered_1km.tif" 
-fp_1km <- file.path(path_root, smoothed_1km_path)
 D.cov2 <- raster::raster(fp_lakes)        # lakes 120m grid
 D.cov.use <- raster::raster(fp_1km)
 
 #FOR FOREST AGE ONLY #
  # pick the raster you want to change
-#D.cov.use[D.cov.use >= 200] <- 0           # replace all 255 values with 0 # might need to resmooth the variable to keep discrete age values
-
+D.cov.use[D.cov.use >= 200] <- 0           # replace all 255 values with 0 # might need to resmooth the variable to keep discrete age values
+freq(D.cov.use, value = NA)
+D.cov.use[is.na(D.cov.use)] <- 0          # replace all NA with 0 for model to run
 
 plot(D.cov.use, main = "Smoothed covariate (1 km)")
 ```
@@ -737,6 +734,7 @@ for (g in seq_len(N.session)) {
 }
 
 # Save bundle
+
 save(data, file = out_rdata)
 cat("Wrote:", out_rdata, "\n")
 ```

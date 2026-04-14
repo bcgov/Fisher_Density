@@ -62,8 +62,8 @@ paths <- list(
   det_all            = file.path(root, "1. MDB-Collation/5. Master data cleaned/Species specific/Fisher/fisher_detections_singledeployment_2026-02-24.csv"),
   det_winter         = file.path(root, "1. MDB-Collation/5. Master data cleaned/Species specific/Fisher/fisher_detections_singledeployment_winter2026-03-02.csv"),
   out_dir            = local_root,
-  save_rdata_winter  = file.path(local_root, "Process_Fisher_camera-DNA_winter-only_Feb.RData"),
-  save_rdata_all     = file.path(local_root, "Process_Fisher_camera-DNA_allseasons_March.RData")
+  save_rdata_winter  = file.path("./3. Outputs/Process_Fisher_camera-DNA_winter-only_Feb.RData"),
+  save_rdata_all     = file.path("./3. Outputs/Process_Fisher_camera-DNA_allseasons_March.RData")
 )
 ```
 
