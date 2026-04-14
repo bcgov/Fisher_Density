@@ -30,8 +30,7 @@ This script reads the **prepared data** saved in **Script 5** and runs an **inte
 
 ```{r parameters}
 # Root path for code and data
-nimble_root <- "C:/LocalR/SCR_Dcov_IntegratedRamsey/1. Scripts"
-path_root <- "C:/LocalR/SCR_Dcov_IntegratedRamsey/3. Outputs"
+path_root <- "./3. Outputs"
 #variable <- "soilMoist" # change this to whatever variable you're running (age, fcover)
 #variable <- "age" 
 variable <- "fcover" 
@@ -43,7 +42,7 @@ input_data_rdata <- load(file.path(path_root,  sprintf("Fit_data_Fisher_%s.RData
 model_type <- "random"   # "fixed" or "random"
 
 # Filenames for model and helpers (adjust names if your repo differs)
-fp <- function(x) file.path(nimble_root, x)
+fp <- function(x) file.path("./", x)
 
 sim_single_file        <- fp("sim.SCR.Dcov.Mb.Ramsey.R")                   # single-session simulator (helper)
 sim_multi_file         <- fp("sim.SCR.Dcov.Multi.Mb.Ramsey.R")             # multisession wrapper (helper)
