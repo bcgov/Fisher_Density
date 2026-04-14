@@ -32,8 +32,8 @@ This script reads the **prepared data** saved in **Script 5** and runs an **inte
 # Root path for code and data
 path_root <- "./3. Outputs"
 #variable <- "soilMoist" # change this to whatever variable you're running (age, fcover)
-#variable <- "age" 
-variable <- "fcover" 
+# variable <- "age"
+variable <- "fcover"
 
 input_data_rdata <- load(file.path(path_root,  sprintf("Fit_data_Fisher_%s.RData", variable))) #output from script 5. 
 # Model type: choose which Nimble model file to source
@@ -349,7 +349,8 @@ out_trace_pdf   <- sprintf("mcmc_trace_%s_%s_%s.pdf",
 
 
 # 1) Read the saved chains (each file contains an mcmc.list of length 1)
-files <- file.path(path_root, sprintf("mcmc_chain_%s_%02d.rds", variable, ch))
+ch <- c(1,2,3)
+files <- file.path(paste0(path_root,"/fcover"), sprintf("mcmc_chain_%s_%02d.rds", variable, ch))
 stopifnot(all(file.exists(files)))
 chains_raw <- lapply(files, readRDS)  # each is mcmc.list of length 1
  
