@@ -1,0 +1,296 @@
+
+---
+title: "Post‑processing MCMC Output (SCR + Cameras): Simple 4‑Step Workflow (v3)"
+author: "Prepared for new analysts"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+  pdf_document: default
+---
+
+# Overview
+
+This compact R Markdown has four steps: **Read → Organize → Summarize → Plot & Save**. It reads `.rds` chains (any reasonable format), aligns parameters by **intersection**, optionally equalizes iterations so `mcmc.list()` is valid, computes **R̂ / n_eff** using **exact name matching** in `MCMCvis::MCMCsummary`, and plots faceted violins. Diagnostic labels are shown **bottom‑left** in each facet.
+
+---
+
+# Parameters
+
+```{r}
+# Files: number of FILES to read (not chains). Each file may contain 1+ chains.
+n_files   <- 3
+covariate <- c("age") # one of: "fcover", "soilMoist", "age"
+file_stub <- paste0("./3. Outputs/",covariate,"/mcmc_chain_",covariate,"_%02d.rds")  # e.g., mcmc_chain_01.rds
+
+# If your .rds top-level object is a LIST, we try these names/index to locate payload
+list_element_hint  <- c("mcmc","mcmc_list","mcmc.list","samples","chains","output","post","fit","draws")
+list_element_index <- NULL  # e.g., 1 if you know it
+
+# Organize options
+align_strategy <- "intersection"  # safest for R̂
+equalize_iter  <- TRUE             # make chains same length
+use_tail       <- TRUE             # keep last common draws
+
+# Optional: drop parameters before summaries/plotting
+drop_lambda_idx  <- integer(0)
+drop_names_extra <- character(0)
+
+# Output
+run_date   <- format(Sys.Date(), "%Y-%m-%d")
+violin_pdf <- sprintf(paste0(covariate,"_violin_faceted_%s.pdf"), run_date)
+violin_png <- sprintf(paste0(covariate,"_violin_faceted_%s.png"), run_date)
+```
+
+---
+
+# Setup
+
+```{r, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 11, fig.height = 8.5)
+
+.require <- function(pkgs){for(p in pkgs){if(!requireNamespace(p, quietly=TRUE)) stop(sprintf("Package '%s' is required.", p)); suppressPackageStartupMessages(library(p, character.only=TRUE))}}
+
+.require(c("coda","MCMCvis","tidyverse","ggplot2","stringr","tibble","scales"))
+```
+
+---
+
+# Step 1 — Read
+
+```{r}
+files <- sprintf(file_stub, 1:n_files)
+stopifnot(all(file.exists(files)))
+
+normalize_to_mcmc_list <- function(x){
+  if (inherits(x, "mcmc")) return(list(x))
+  if (inherits(x, "mcmc.list")) return(lapply(seq_along(x), function(i) x[[i]]))
+  if (is.matrix(x) || is.data.frame(x)) return(list(coda::as.mcmc(as.matrix(x))))
+  if (is.list(x)) return(extract_from_list(x))
+  stop(sprintf("Unsupported object class: %s", paste(class(x), collapse=",")))
+}
+
+extract_from_list <- function(obj){
+  if (!is.null(list_element_index)){
+    cand <- obj[[list_element_index]]; return(normalize_to_mcmc_list(cand))
+  }
+  nms <- names(obj)
+  if (!is.null(nms)){
+    for (h in list_element_hint) if (h %in% nms) return(normalize_to_mcmc_list(obj[[h]]))
+  }
+  out <- list()
+  for (i in seq_along(obj)){
+    tr <- try(normalize_to_mcmc_list(obj[[i]]), silent=TRUE)
+    if(!inherits(tr, "try-error")) out <- c(out, tr)
+  }
+  if (length(out)) return(out)
+  stop("Could not locate mcmc payload inside list.")
+}
+
+chains_by_file <- lapply(files, function(f) normalize_to_mcmc_list(readRDS(f)))
+chains_mcmc    <- unlist(chains_by_file, recursive = FALSE)
+stopifnot(length(chains_mcmc) >= 1)
+```
+
+---
+
+# Step 2 — Organize
+
+```{r}
+# Align to intersection of parameter names (safest for R̂)
+if (align_strategy != "intersection") stop("Only 'intersection' is supported in this template.")
+common_params <- Reduce(intersect, lapply(chains_mcmc, colnames))
+stopifnot(length(common_params) > 0)
+
+# Subset/reorder columns using first chain as template
+template_common <- colnames(chains_mcmc[[1]])[colnames(chains_mcmc[[1]]) %in% common_params]
+X <- lapply(chains_mcmc, function(ch) as.matrix(ch)[, template_common, drop = FALSE])
+
+# Equalize iterations if requested (so mcpar matches across chains)
+if (equalize_iter){
+  nmin <- min(vapply(X, nrow, integer(1)))
+  X <- lapply(X, function(m){ idx <- if (use_tail) seq.int(to = nrow(m), length.out = nmin) else seq_len(nmin); m[idx, , drop=FALSE] })
+}
+
+# Wrap as uniform mcmc and combine
+mcmc_list <- coda::mcmc.list(lapply(X, function(m) coda::mcmc(m, start=1, end=nrow(m), thin=1)))
+
+# Optional drop (simple)
+if (length(drop_lambda_idx) + length(drop_names_extra) > 0){
+  dnames <- c(paste0("lambda.N[", drop_lambda_idx, "]"), drop_names_extra)
+  keep   <- !(colnames(as.matrix(mcmc_list[[1]])) %in% dnames)
+  mcmc_list <- coda::mcmc.list(lapply(mcmc_list, function(ch) coda::as.mcmc(as.matrix(ch)[, keep, drop=FALSE])))
+}
+```
+
+---
+
+# Step 3 — Summarize (tidy + diagnostics)
+
+```{r}
+# Tidy draws
+mats <- lapply(mcmc_list, as.matrix)
+df <- purrr::map2_dfr(mats, seq_along(mats), ~ as.data.frame(.x) %>%
+  dplyr::mutate(iter = dplyr::row_number(), chain = .y) %>%
+  tidyr::pivot_longer(-c(iter, chain), names_to = "param", values_to = "value"))
+
+# Keep N and beta-like (edit patterns as needed)
+df_sub <- df %>% dplyr::filter(stringr::str_detect(param, "^N(\\[|$)|^N(_|$)") |
+                               stringr::str_detect(param, "^(D\\.beta|D\\[|coef_)"))
+stopifnot(nrow(df_sub) > 0)
+
+# 80% interval + median
+summ <- df_sub %>% dplyr::group_by(param) %>% dplyr::summarise(
+  q10 = stats::quantile(value, 0.10, na.rm=TRUE),
+  q90 = stats::quantile(value, 0.90, na.rm=TRUE),
+  med = stats::median(value, na.rm=TRUE), .groups = "drop")
+
+# order facets by median
+param_levels <- summ %>% dplyr::arrange(med) %>% dplyr::pull(param)
+df_sub <- df_sub %>% dplyr::mutate(param = factor(param, levels = param_levels))
+summ   <- summ   %>% dplyr::mutate(param = factor(param, levels = param_levels))
+
+# Diagnostics (robust + exact matching)
+params_plotted <- as.character(levels(df_sub$param))
+par_avail      <- colnames(as.matrix(mcmc_list[[1]]))
+params_target  <- intersect(params_plotted, par_avail)
+has_multi      <- length(mcmc_list) >= 2
+
+get_diag <- function(){
+  if (has_multi && length(params_target) > 0){
+    ms <- try(MCMCvis::MCMCsummary(mcmc_list,
+                                   params = params_target,
+                                   ISB    = FALSE,   # do NOT ignore brackets
+                                   exact  = TRUE,    # match names exactly
+                                   Rhat   = TRUE,
+                                   n.eff  = TRUE,
+                                   round  = 3), silent = TRUE)
+    if (!inherits(ms, "try-error") && !is.null(ms)){
+      return(tibble::tibble(param = factor(rownames(ms), levels = params_plotted),
+                            Rhat  = as.numeric(ms[,"Rhat"]),
+                            neff  = as.numeric(ms[,"n.eff"])) )
+    }
+  }
+  # Fallback
+  ess_all <- coda::effectiveSize(mcmc_list)
+  ess_vec <- as.numeric(ess_all[params_target]); names(ess_vec) <- params_target
+  if (has_multi){
+    rhat_vec <- sapply(params_target, function(par){
+      ml <- coda::mcmc.list(lapply(mcmc_list, function(ch){ m <- as.matrix(ch)[,par,drop=FALSE]; coda::mcmc(m, start=1, end=nrow(m), thin=1) }))
+      suppressWarnings(coda::gelman.diag(ml, autoburnin=FALSE, multivariate=FALSE)$psrf["Point est."])
+    })
+  } else { rhat_vec <- rep(NA_real_, length(params_target)); names(rhat_vec) <- params_target }
+  tibble::tibble(param = factor(params_target, levels = params_plotted), Rhat = as.numeric(rhat_vec), neff = as.numeric(ess_vec))
+}
+
+diag_df <- get_diag()
+
+# Label anchor (BOTTOM‑LEFT): slightly left of center (x=0.6) and near ymin
+label_pos <- df_sub %>% dplyr::group_by(param) %>% dplyr::summarise(
+  y_min = min(value, na.rm=TRUE), y_max = max(value, na.rm=TRUE), .groups = "drop") %>%
+  dplyr::mutate(x_lab = 0.6, y_lab = y_min + 0.02*(y_max - y_min + 1e-8))
+
+# Label text
+diag_labels <- diag_df %>% dplyr::right_join(label_pos, by = "param") %>% dplyr::mutate(
+  label = dplyr::case_when(
+    !is.na(Rhat) ~ sprintf("R̂ = %.02f\nn_eff = %s", Rhat, scales::comma(neff, accuracy = 1)),
+    has_multi    ~ sprintf("R̂: undefined (const/too few draws)\nn_eff = %s", scales::comma(neff, accuracy = 1)),
+    TRUE         ~ sprintf("R̂: needs ≥2 chains\nn_eff (within) = %s", scales::comma(neff, accuracy = 1))
+  )
+)
+```
+
+---
+
+# Step 4 — Plot & Save
+
+```{r}
+# Step 4 — Plot & Save (revised ordering + bottom-left labels with extra space)
+
+# --- 1) Reorder panels so all D.beta[...] come first, in numeric order ---
+# Start from the current factor levels created earlier
+current_lvls <- levels(df_sub$param)
+
+# Identify beta-like names robustly:
+#   matches "D.beta[3]" OR "D.beta1[3]" etc. (anything that starts with D.beta and has [k])
+is_dbeta <- stringr::str_detect(current_lvls, "^D\\.beta.*\\[\\d+\\]$")
+
+dbeta_ids <- current_lvls[is_dbeta]
+
+# Order numerically by the index inside the brackets [...] (after the last '[')
+dbeta_order <- dbeta_ids[order(
+  as.integer(stringr::str_extract(dbeta_ids, "(?<=\\[)\\d+(?=\\])"))
+)]
+
+# Keep all other parameters after, preserving their current relative order
+other_order <- current_lvls[!is_dbeta]
+new_levels  <- c(dbeta_order, other_order)
+
+# Apply new ordering to 'param' across all objects used in the plot
+df_sub      <- df_sub      %>% dplyr::mutate(param = factor(param, levels = new_levels))
+summ        <- summ        %>% dplyr::mutate(param = factor(param, levels = new_levels))
+diag_labels <- diag_labels %>% dplyr::mutate(param = factor(param, levels = new_levels))
+
+# --- 2) Zero line only on β facets (recomputed after we reset levels) ---
+is_beta     <- stringr::str_detect(levels(df_sub$param), "^D\\.beta")
+beta_params <- levels(df_sub$param)[is_beta]
+
+if (length(beta_params) > 0) {
+  zero_df <- tibble::tibble(
+    param = factor(beta_params, levels = levels(df_sub$param)),
+    yint  = 0
+  )
+} else {
+  zero_df <- tibble::tibble(
+    param = factor(character(), levels = levels(df_sub$param)),
+    yint  = numeric()
+  )
+}
+
+# --- 3) Plot with extra lower expansion so the label never gets cut off ---
+p <- ggplot(df_sub, aes(x = 1, y = value)) +
+  geom_violin(fill = "#7aa6c2", color = "grey25", alpha = 0.85, trim = FALSE) +
+  geom_errorbar(
+    data = summ, inherit.aes = FALSE,
+    aes(x = 1, ymin = q10, ymax = q90),
+    width = 0.2, size = 0.9
+  ) +
+  geom_point(
+    data = summ, inherit.aes = FALSE,
+    aes(x = 1, y = med),
+    size = 1.8
+  ) +
+  facet_wrap(~ param, scales = "free_y", ncol = 3) +
+  scale_x_continuous(breaks = NULL) +
+  # Asymmetric expansion: more room at the bottom for the R̂ / n_eff label
+  scale_y_continuous(expand = expansion(mult = c(0.14, 0.05))) +
+  labs(
+    x = NULL, y = "Posterior draw",
+    title = "Posterior distributions for N and β parameters"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold")
+  ) +
+  geom_hline(
+    data = zero_df, inherit.aes = FALSE,
+    aes(yintercept = yint),
+    linetype = "dashed", linewidth = 0.6
+  ) +
+  # Bottom-left diagnostic labels.
+  # NOTE: 'diag_labels' was built earlier and already contains x_lab / y_lab / label
+  geom_text(
+    data = diag_labels, inherit.aes = FALSE,
+    aes(x = x_lab, y = y_lab, label = label),
+    size = 3.1, lineheight = 1.05,
+    hjust = 0, vjust = 1
+  )
+
+print(p)
+
+# (Optional) Save here, or keep your separate save chunk
+invisible(ggsave(violin_pdf, plot = p, width = 11, height = 8.5))
+invisible(ggsave(violin_png, plot = p, width = 11, height = 8.5, dpi = 300))
+```
