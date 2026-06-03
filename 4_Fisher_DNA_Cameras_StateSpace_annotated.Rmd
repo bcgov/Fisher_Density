@@ -39,7 +39,7 @@ invisible(lapply(pkgs, library, character.only = TRUE))
 
 ```{r parameters}
 species_of_interest <- "Pekania pennanti"
-season              <- "all"     # "winter" or "all"
+season              <- "winter"     # "winter" or "all"
 crs_wgs84           <- 4326
 crs_albers          <- 3005          # BC Albers (meters)
 buffer_m            <- 17000         # Columbian AOI buffer
